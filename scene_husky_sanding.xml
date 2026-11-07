@@ -1,0 +1,87 @@
+<mujoco model="husky_ur10e_sanding_scene">
+  <include file="husky_ur10e_sander.xml"/>
+
+  <visual>
+    <headlight diffuse="0.7 0.7 0.7" ambient="0.25 0.25 0.25" specular="0.15 0.15 0.15"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="140" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <!-- Sky & Environment Textures -->
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0.05 0.05 0.1" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.25 0.28 0.32" rgb2="0.18 0.20 0.24"
+             markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="15 15" reflectance="0.15"/>
+
+    <!-- Industrial Wall Materials -->
+    <material name="wood_wall" rgba="0.78 0.66 0.52 1" specular="0.15" shininess="0.1"/>
+    <material name="frame_steel" rgba="0.22 0.24 0.26 1" specular="0.6" shininess="0.4"/>
+    <material name="sanding_zone" rgba="0.88 0.78 0.65 1" specular="0.25" shininess="0.25"/>
+    <material name="guide_stripe" rgba="0.95 0.70 0.10 1" specular="0.3" shininess="0.2"/>
+  </asset>
+
+  <worldbody>
+    <!-- Lighting Setup -->
+    <light pos="0 0 6" dir="0 0 -1" diffuse="0.8 0.8 0.8" specular="0.3 0.3 0.3" directional="true"/>
+    <light pos="0 3 4" dir="0 -0.8 -0.6" diffuse="0.7 0.7 0.7" specular="0.3 0.3 0.3"/>
+    <light pos="-2 -2 5" dir="0.5 0.5 -1" diffuse="0.5 0.5 0.5"/>
+
+    <!-- Large 30m x 30m Factory Testbed Ground Plane -->
+    <geom name="floor" size="15 15 0.05" type="plane" material="groundplane" friction="1.2 0.005 0.0001"/>
+
+    <!-- Ground Corridor Guidance Stripes (Parallel to Wall at Y = 0.0 m) -->
+    <geom name="lane_marker_left" type="box" pos="0.5 -0.38 0.001" size="3.5 0.02 0.001" material="guide_stripe" contype="0" conaffinity="0"/>
+    <geom name="lane_marker_right" type="box" pos="0.5 0.38 0.001" size="3.5 0.02 0.001" material="guide_stripe" contype="0" conaffinity="0"/>
+
+    <!-- ========================================================================= -->
+    <!-- Extended Tall Wall Assembly (6.0m length along X, front contact at Y = 0.80m) -->
+    <!-- ========================================================================= -->
+    <body name="tall_wall_assembly" pos="0.5 0.85 0.80">
+      <!-- Main wooden wall cuboid: Length 6.0m, Height 1.6m, Thickness 0.1m -->
+      <!-- Front contact surface is exactly at Y = 0.85 - 0.05 = 0.8000 m -->
+      <geom name="tall_wall" type="box" size="3.0 0.05 0.80" material="wood_wall"
+            solref="0.02 1.0" solimp="0.01 0.95 0.005 0.5 2" friction="0.04 0.005 0.0001"/>
+
+      <!-- Extended Visual Sanding Target Patch along the full length of the wall -->
+      <!-- Spans X in [-2.2m, +3.2m] (Length 5.4m), Z in [0.65m, 1.25m] (Height 0.60m) -->
+      <geom name="sanding_target_patch" type="box" pos="0 -0.0505 0.15" size="2.7 0.001 0.30"
+            material="sanding_zone" contype="0" conaffinity="0"/>
+
+      <!-- Steel Structural Support Columns along Wall -->
+      <geom name="post_m25" type="box" pos="-3.01 0 0" size="0.03 0.06 0.80" material="frame_steel" contype="0" conaffinity="0"/>
+      <geom name="post_m15" type="box" pos="-1.50 0 0" size="0.025 0.06 0.80" material="frame_steel" contype="0" conaffinity="0"/>
+      <geom name="post_0"   type="box" pos="0.00 0 0" size="0.025 0.06 0.80" material="frame_steel" contype="0" conaffinity="0"/>
+      <geom name="post_p15" type="box" pos="1.50 0 0" size="0.025 0.06 0.80" material="frame_steel" contype="0" conaffinity="0"/>
+      <geom name="post_p30" type="box" pos="3.01 0 0" size="0.03 0.06 0.80" material="frame_steel" contype="0" conaffinity="0"/>
+
+      <!-- Floor Mounting Stabilizer Feet -->
+      <geom name="foot_m25" type="box" pos="-3.01 0 -0.78" size="0.04 0.25 0.02" material="frame_steel" contype="0" conaffinity="0"/>
+      <geom name="foot_m15" type="box" pos="-1.50 0 -0.78" size="0.03 0.22 0.02" material="frame_steel" contype="0" conaffinity="0"/>
+      <geom name="foot_0"   type="box" pos="0.00 0 -0.78" size="0.03 0.22 0.02" material="frame_steel" contype="0" conaffinity="0"/>
+      <geom name="foot_p15" type="box" pos="1.50 0 -0.78" size="0.03 0.22 0.02" material="frame_steel" contype="0" conaffinity="0"/>
+      <geom name="foot_p30" type="box" pos="3.01 0 -0.78" size="0.04 0.25 0.02" material="frame_steel" contype="0" conaffinity="0"/>
+
+      <!-- Top Stiffening Beam -->
+      <geom name="top_beam" type="box" pos="0 0 0.81" size="3.04 0.06 0.015" material="frame_steel" contype="0" conaffinity="0"/>
+    </body>
+
+    <!-- ========================================================================= -->
+    <!-- Strategic Camera Views for Whole-Body Loco-Manipulation Observation       -->
+    <!-- ========================================================================= -->
+    <!-- Dynamic Tracking Camera: Follows base while maintaining angle on sanding contact -->
+    <camera name="tracking_sanding" mode="trackcom" target="base_link" pos="2.0 -2.0 1.6" xyaxes="0.707 0.707 0 -0.354 0.354 0.866"/>
+
+    <!-- End-Effector / Tool Closeup Camera: Tracks the sanding disc pressed against the wall -->
+    <camera name="tool_closeup" mode="trackcom" target="wrist_3_link" pos="0.8 -0.8 0.6"/>
+
+    <!-- Isometric Factory Overview: Fixed global viewpoint showing the full length of the wall -->
+    <camera name="isometric_overview" pos="4.5 -4.0 3.5" xyaxes="0.707 0.707 0 -0.38 0.38 0.84"/>
+
+    <!-- Corridor Profile Camera: Looking down the length of the wall (+X direction) -->
+    <camera name="corridor_profile" pos="-3.5 0.0 1.2" xyaxes="0 1 0 0 0 1"/>
+
+    <!-- Top-Down View: Global trajectory monitoring -->
+    <camera name="top_down" pos="0.5 0.4 6.5" xyaxes="1 0 0 0 1 0"/>
+  </worldbody>
+</mujoco>

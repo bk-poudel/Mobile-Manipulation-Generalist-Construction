@@ -59,7 +59,14 @@ class HybridForcePositionController:
     """
     Hybrid Position/Force Controller for UR10e sanding on a vertical wall.
     """
-    def __init__(self, model: mujoco.MjModel, data: mujoco.MjData, initial_offset: float = 0.10):
+    def __init__(self, model: mujoco.MjModel, data: mujoco.MjData,
+                 initial_offset: float = 0.10, desired_force: float = 1.0,
+                 v_approach: float = 0.01, f_thresh: float = 0.30,
+                 freq_x: float = 0.04, freq_z: float = 0.02,
+                 ax: float = 0.04, az: float = 0.02,
+                 kp_f: float = 0.70, ki_f: float = 1.80, kd_f: float = 3.50,
+                 kp_p: float = 40.0, kd_p: float = 10.0,
+                 kp_tilt: float = 100.0, kd_tilt: float = 12.0):
         self.model = model
         self.data = data
         self.dt = model.opt.timestep
@@ -74,22 +81,22 @@ class HybridForcePositionController:
         self.y_wall = 0.8000
 
         # Target Force & Contact Detection Threshold
-        self.F_desired = 1.0          # 1.0 Newton desired pressing force
-        self.F_contact_thresh = 0.30  # Force threshold to detect wall contact
+        self.F_desired = desired_force        # Desired normal pressing force (N)
+        self.F_contact_thresh = f_thresh      # Force threshold to detect wall contact (N)
 
         # State Tracking
-        self.state = "APPROACH"       # "APPROACH" or "SANDING"
+        self.state = "APPROACH"               # "APPROACH" or "SANDING"
         self.contact_detected = False
         self.t_contact = 0.0
 
         # Approach Phase Parameters
-        self.v_approach = 0.04        # 0.04 m/s (4 cm/s) forward approach velocity
-        self.Kv_approach = 25.0       # Velocity damping gain during approach
+        self.v_approach = v_approach          # Forward approach velocity into wall (m/s)
+        self.Kv_approach = 25.0               # Velocity damping gain during approach
 
         # Force Control Gains (Normal axis Y during Sanding)
-        self.Kp_f = 0.70              # Proportional gain on force error
-        self.Ki_f = 1.80              # Integral gain on force error
-        self.Kd_f = 3.50              # Task-space normal velocity damping
+        self.Kp_f = kp_f                      # Proportional gain on force error
+        self.Ki_f = ki_f                      # Integral gain on force error
+        self.Kd_f = kd_f                      # Task-space normal velocity damping
         self.force_integral = 0.0
 
         # Low-pass filter for force sensor (1st order IIR, removes numerical contact chatter)
@@ -97,28 +104,35 @@ class HybridForcePositionController:
         self.alpha_filter = 0.15
 
         # Tangential Position Control Gains (X and Z axes)
-        self.Kp_p = 40.0              # Task-space position proportional gain (N/m)
-        self.Kd_p = 10.0              # Task-space velocity damping (N*s/m)
+        self.Kp_p = kp_p                      # Task-space position proportional gain (N/m)
+        self.Kd_p = kd_p                      # Task-space velocity damping (N*s/m)
 
-        # Orientation Control Gains
-        self.Kd_rot = 2.5             # Angular velocity damping
+        # Orientation Stiffness & Damping:
+        # Tilt axes (X and Z): High stiffness to keep disc flush so contact surface never moves outside
+        # Perpendicular axis (Y): Soft compliance / damping for friction relief and wrist flexibility
+        self.Kp_tilt = kp_tilt                # High restoring stiffness for pitch and yaw (Nm/rad)
+        self.Kd_tilt = kd_tilt                # Tilt angular damping (Nms/rad)
+        self.Kp_perp = 5.0                    # Soft compliance about normal axis (Nm/rad)
+        self.Kd_perp = 2.0                    # Torsional damping about normal axis (Nms/rad)
+        self.Kp_rot = np.array([self.Kp_tilt, self.Kp_perp, self.Kp_tilt])
+        self.Kd_rot = np.array([self.Kd_tilt, self.Kd_perp, self.Kd_tilt])
 
         # Nullspace Joint Damping
         self.D_null = 0.20
 
         # Desired Orientation Matrix (Sanding disc normal aligned with +Y into wall)
         Rx = np.array([1.0, 0.0, 0.0])
-        Rz = np.array([0.0, 1.0, 0.0])  # Tool Z points along +Y
-        Ry = np.cross(Rz, Rx)          # Tool Y points along -Z
+        Rz = np.array([0.0, 1.0, 0.0])        # Tool Z points along +Y
+        Ry = np.cross(Rz, Rx)                # Tool Y points along -Z
         self.R_desired = np.column_stack([Rx, Ry, Rz])
 
-        # Sweeping Trajectory Settings (Perpendicular X-Z plane)
+        # Sweeping Trajectory Settings
         self.x_center = -0.15
         self.z_center = 0.70
-        self.Ax = 0.04                # 8 cm horizontal sweep amplitude (+- 4 cm)
-        self.Az = 0.02                # 4 cm vertical scan amplitude (+- 2 cm)
-        self.freq_x = 0.12            # 0.12 Hz sweeping frequency
-        self.freq_z = 0.04            # 0.04 Hz vertical shift frequency
+        self.Ax = ax                          # Horizontal sweep amplitude (m)
+        self.Az = az                          # Vertical scan amplitude (m)
+        self.freq_x = freq_x                  # Horizontal sweep frequency (Hz)
+        self.freq_z = freq_z                  # Vertical scan frequency (Hz)
 
         # Preallocated buffers for Jacobian and contact wrench
         self.jacp = np.zeros((3, self.model.nv))
@@ -148,13 +162,23 @@ class HybridForcePositionController:
         y_init = self.y_wall - self.initial_offset
         target_init = np.array([self.x_center, y_init, self.z_center])
 
-        for _ in range(150):
+        # Kinematic convergence to ensure exact initial standoff and perpendicular orientation
+        for _ in range(250):
             mujoco.mj_forward(self.model, self.data)
             pos_err = target_init - self.data.site_xpos[self.tcp_id]
+            R_curr = self.data.site_xmat[self.tcp_id].reshape(3, 3)
+            rot_err = 0.5 * (
+                np.cross(R_curr[:, 0], self.R_desired[:, 0]) +
+                np.cross(R_curr[:, 1], self.R_desired[:, 1]) +
+                np.cross(R_curr[:, 2], self.R_desired[:, 2])
+            )
+            if np.linalg.norm(pos_err) < 1e-4 and np.linalg.norm(rot_err) < 1e-4:
+                break
             mujoco.mj_jacSite(self.model, self.data, self.jacp, self.jacr, self.tcp_id)
             J = np.vstack([self.jacp, self.jacr])
-            dq = J.T @ np.linalg.solve(J @ J.T + 1e-4 * np.eye(6), np.concatenate([pos_err, np.zeros(3)]))
-            self.data.qpos[:] += dq * 0.5
+            err_6d = np.concatenate([pos_err, rot_err])
+            dq = J.T @ np.linalg.solve(J @ J.T + 1e-4 * np.eye(6), err_6d)
+            self.data.qpos[:] += dq * 0.4
 
         self.data.qvel[:] = 0.0
         mujoco.mj_forward(self.model, self.data)
@@ -244,8 +268,17 @@ class HybridForcePositionController:
         f_x = self.Kp_p * (x_des - p_curr[0]) + self.Kd_p * (vx_des - v_curr[0])
         f_z = self.Kp_p * (z_des - p_curr[2]) + self.Kd_p * (vz_des - v_curr[2])
 
-        # 5. Rotational Compliance (pad aligns flush against flat wall)
-        tau_rot = -self.Kd_rot * omega_curr
+        # 5. Orientation Control:
+        # Tool normal points strictly into the wall (+Y)
+        # Pitch and Yaw (rotations about X and Z) are SOLID with high restoring stiffness so contact surface never tilts outside
+        # Perpendicular rotation (torsion about +Y) is COMPLIANT with soft damping
+        R_curr = self.data.site_xmat[self.tcp_id].reshape(3, 3)
+        rot_err = 0.5 * (
+            np.cross(R_curr[:, 0], self.R_desired[:, 0]) +
+            np.cross(R_curr[:, 1], self.R_desired[:, 1]) +
+            np.cross(R_curr[:, 2], self.R_desired[:, 2])
+        )
+        tau_rot = self.Kp_rot * rot_err - self.Kd_rot * omega_curr
 
         # 6. Operational Space Hybrid Wrench:
         # F_task = [f_x (pos), f_y (force), f_z (pos), tau_rx, tau_ry, tau_rz]
@@ -262,13 +295,25 @@ class HybridForcePositionController:
         return tau_cmd, F_meas, f_err, p_curr.copy(), target_pos, self.state
 
 
-def run_headless(duration: float = 12.0, plot: bool = False, offset: float = 0.10):
+def run_headless(duration: float = 12.0, plot: bool = False, offset: float = 0.10,
+                 force: float = 1.0, v_approach: float = 0.01, f_thresh: float = 0.30,
+                 freq_x: float = 0.04, freq_z: float = 0.02, ax: float = 0.04, az: float = 0.02,
+                 kp_f: float = 0.70, ki_f: float = 1.80, kd_f: float = 3.50,
+                 kp_p: float = 40.0, kd_p: float = 10.0,
+                 kp_tilt: float = 100.0, kd_tilt: float = 12.0,
+                 plot_name: str = "sanding_performance.png"):
     """Run headless simulation and print comprehensive performance metrics."""
     model_path = os.path.join(os.path.dirname(__file__), "scene_sanding.xml")
     model = mujoco.MjModel.from_xml_path(model_path)
     data = mujoco.MjData(model)
 
-    controller = HybridForcePositionController(model, data, initial_offset=offset)
+    controller = HybridForcePositionController(
+        model, data, initial_offset=offset, desired_force=force,
+        v_approach=v_approach, f_thresh=f_thresh,
+        freq_x=freq_x, freq_z=freq_z, ax=ax, az=az,
+        kp_f=kp_f, ki_f=ki_f, kd_f=kd_f, kp_p=kp_p, kd_p=kd_p,
+        kp_tilt=kp_tilt, kd_tilt=kd_tilt
+    )
     controller.initialize_pose()
 
     total_steps = int(duration / model.opt.timestep)
@@ -285,7 +330,8 @@ def run_headless(duration: float = 12.0, plot: bool = False, offset: float = 0.1
 
     print(f"--- Running Hybrid Position/Force Sanding Simulation ({duration} s) ---")
     print(f"Initial Offset from Wall: {offset:.3f} m (Initial Y = {controller.y_wall - offset:.4f} m)")
-    print(f"Target Normal Force:      {controller.F_desired} N | Timestep: {model.opt.timestep} s")
+    print(f"Target Normal Force:      {force:.2f} N (Kp={kp_f}, Ki={ki_f}, Kd={kd_f}) | Timestep: {model.opt.timestep} s")
+    print(f"Sweeping Parameters:      fx={freq_x}Hz, fz={freq_z}Hz | Ax={ax*100:.1f}cm, Az={az*100:.1f}cm")
 
     start_wall_time = time.time()
     for step in range(total_steps):
@@ -332,7 +378,7 @@ def run_headless(duration: float = 12.0, plot: bool = False, offset: float = 0.1
     print(f"Contact Established At:  t = {t_contact:.3f} s")
     print(f"Desired Normal Force:    {controller.F_desired:.3f} N")
     if len(sanding_forces) > 0:
-        print(f"Mean Sanding Force:      {np.mean(sanding_forces):.4f} N (target: 1.000 N)")
+        print(f"Mean Sanding Force:      {np.mean(sanding_forces):.4f} N (target: {controller.F_desired:.3f} N)")
         print(f"Force Error (Mean | RMS):{np.mean(sanding_errors):+.4f} N | {np.sqrt(np.mean(sanding_errors**2)):.4f} N")
         print(f"Force Std Dev:           {np.std(sanding_forces):.4f} N")
         print(f"Min / Max Sanding Force: {np.min(sanding_forces):.4f} N / {np.max(sanding_forces):.4f} N")
@@ -341,39 +387,40 @@ def run_headless(duration: float = 12.0, plot: bool = False, offset: float = 0.1
 
     if plot:
         generate_performance_plot(times, forces, errors, x_positions, y_positions, z_positions,
-                                  x_targets, y_targets, z_targets, t_contact, offset)
+                                  x_targets, z_targets, t_contact, force, offset, plot_name=plot_name)
 
 
-def generate_performance_plot(times, forces, errors, x_pos, y_pos, z_pos, x_tar, y_tar, z_tar, t_contact, offset):
+def generate_performance_plot(times, forces, errors, x_pos, y_pos, z_pos, x_tar, z_tar, t_contact, f_target, offset,
+                              plot_name: str = "sanding_performance.png"):
     """Plot force tracking, normal approach, and sweeping pattern to a high-resolution PNG."""
+    import matplotlib
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle("UR10e Hybrid Position/Force Sanding Performance Evaluation", fontsize=15, fontweight="bold")
 
     # 1. Normal Force Tracking (Top-Left)
-    axs[0, 0].plot(times, forces, color="#1f77b4", linewidth=1.8, label=r"Measured Force ($F_{meas}$)")
-    axs[0, 0].axhline(1.0, color="#d62728", linestyle="--", linewidth=1.8, label="Target Force (1.0 N)")
-    axs[0, 0].fill_between(times, 0.8, 1.2, color="#2ca02c", alpha=0.15, label=r"$\pm 0.2$ N Band")
+    axs[0, 0].plot(times, forces, color="#1f77b4", linewidth=2.0, label=r"Measured Force ($F_y$)")
+    axs[0, 0].axhline(f_target, color="#d62728", linestyle="--", linewidth=1.8, label=f"Target Force ({f_target:.1f} N)")
+    axs[0, 0].fill_between(times, f_target - 0.2, f_target + 0.2, color="#2ca02c", alpha=0.15, label=r"$\pm 0.2$ N Band")
     if t_contact > 0:
         axs[0, 0].axvline(t_contact, color="purple", linestyle=":", linewidth=1.8, label=f"Contact (t={t_contact:.2f}s)")
-        axs[0, 0].text(t_contact * 0.4, 2.2, "APPROACH\nPHASE", fontsize=10, fontweight="bold",
-                       color="darkblue", ha="center")
-        axs[0, 0].text((times[-1] + t_contact) * 0.5, 2.2, "ACTIVE SANDING\nPHASE", fontsize=10, fontweight="bold",
-                       color="darkgreen", ha="center")
+        axs[0, 0].axvspan(t_contact, times[-1], color="yellow", alpha=0.15, label="Sanding Phase")
     axs[0, 0].set_ylabel("Normal Force [N]", fontsize=11, fontweight="bold")
-    axs[0, 0].set_title("Normal Force Regulation: Free Approach & 1.0 N Contact", fontsize=12, fontweight="bold")
-    axs[0, 0].set_ylim(-0.1, 2.8)
+    axs[0, 0].set_title(f"Normal Force Regulation ({f_target:.1f} N Target)", fontsize=12, fontweight="bold")
+    axs[0, 0].set_ylim(-0.1, max(3.5, f_target * 2.5))
     axs[0, 0].grid(True, linestyle=":", alpha=0.6)
     axs[0, 0].legend(loc="upper right", framealpha=0.9, fontsize=9)
 
     # 2. Normal Axis Approach Trajectory Y(t) (Top-Right)
     axs[0, 1].plot(times, y_pos, color="#2ca02c", linewidth=2.0, label="TCP Y(t) Actual")
     axs[0, 1].axhline(0.8000, color="darkred", linestyle="--", linewidth=1.8, label="Wall Surface (Y=0.8000 m)")
-    axs[0, 1].axhline(0.8000 - offset, color="gray", linestyle=":", linewidth=1.5, label=f"Initial Offset ({offset} m)")
+    axs[0, 1].axhline(0.8000 - offset, color="gray", linestyle=":", linewidth=1.5, label=f"Initial Offset ({offset:.2f} m)")
     if t_contact > 0:
         axs[0, 1].axvline(t_contact, color="purple", linestyle=":", linewidth=1.8)
     axs[0, 1].set_ylabel("Normal Position Y [m]", fontsize=11, fontweight="bold")
-    axs[0, 1].set_title(f"Normal Approach: 0.1 m Offset to Wall Surface", fontsize=12, fontweight="bold")
+    axs[0, 1].set_title(f"Normal Approach: {offset:.2f} m Offset to Wall Surface", fontsize=12, fontweight="bold")
     axs[0, 1].grid(True, linestyle=":", alpha=0.6)
     axs[0, 1].legend(loc="lower right", framealpha=0.9, fontsize=9)
 
@@ -386,7 +433,7 @@ def generate_performance_plot(times, forces, errors, x_pos, y_pos, z_pos, x_tar,
         axs[1, 0].axvline(t_contact, color="purple", linestyle=":", linewidth=1.8, label="Sanding Begins")
     axs[1, 0].set_xlabel("Time [s]", fontsize=11, fontweight="bold")
     axs[1, 0].set_ylabel("Tangential Position [m]", fontsize=11, fontweight="bold")
-    axs[1, 0].set_title("Tangential Sanding Trajectory (Sweeps after contact)", fontsize=12, fontweight="bold")
+    axs[1, 0].set_title("Tangential Sanding Trajectory (X & Z Sweeps)", fontsize=12, fontweight="bold")
     axs[1, 0].grid(True, linestyle=":", alpha=0.6)
     axs[1, 0].legend(loc="upper left", framealpha=0.9, fontsize=9, ncol=2)
 
@@ -403,12 +450,17 @@ def generate_performance_plot(times, forces, errors, x_pos, y_pos, z_pos, x_tar,
     axs[1, 1].legend(loc="upper right", framealpha=0.9, fontsize=9)
 
     plt.tight_layout()
-    output_img = "sanding_performance.png"
-    plt.savefig(output_img, dpi=200)
-    print(f"Performance plot saved successfully to: {output_img}")
+    output_path = os.path.join(os.path.dirname(__file__), plot_name)
+    plt.savefig(output_path, dpi=200)
+    print(f"Performance plot saved successfully to: {output_path}")
 
 
-def run_gui(duration: float = None, offset: float = 0.10):
+def run_gui(duration: float = None, offset: float = 0.10,
+            force: float = 1.0, v_approach: float = 0.01, f_thresh: float = 0.30,
+            freq_x: float = 0.04, freq_z: float = 0.02, ax: float = 0.04, az: float = 0.02,
+            kp_f: float = 0.70, ki_f: float = 1.80, kd_f: float = 3.50,
+            kp_p: float = 40.0, kd_p: float = 10.0,
+            kp_tilt: float = 100.0, kd_tilt: float = 12.0):
     """Launch interactive 3D viewer demonstrating the approach and sanding task in real time."""
     import mujoco.viewer
 
@@ -416,33 +468,41 @@ def run_gui(duration: float = None, offset: float = 0.10):
     model = mujoco.MjModel.from_xml_path(model_path)
     data = mujoco.MjData(model)
 
-    controller = HybridForcePositionController(model, data, initial_offset=offset)
+    controller = HybridForcePositionController(
+        model, data, initial_offset=offset, desired_force=force,
+        v_approach=v_approach, f_thresh=f_thresh,
+        freq_x=freq_x, freq_z=freq_z, ax=ax, az=az,
+        kp_f=kp_f, ki_f=ki_f, kd_f=kd_f, kp_p=kp_p, kd_p=kd_p,
+        kp_tilt=kp_tilt, kd_tilt=kd_tilt
+    )
     controller.initialize_pose()
 
     print("=" * 65)
     print("           Interactive MuJoCo 3D Sanding Viewer")
     print("=" * 65)
-    print(f"Starting at {offset:.2f} m offset away from wall (Y = {controller.y_wall - offset:.4f} m).")
-    print("Robot approaches the wall until contact force is detected, then sweeps!")
+    print(f"Parameters:")
+    print(f"  • Starting Standoff       : {offset:.2f} m (Y = {controller.y_wall - offset:.4f} m)")
+    print(f"  • Target Normal Force     : {force:.2f} N (Kp={kp_f}, Ki={ki_f}, Kd={kd_f})")
+    print(f"  • Approach Velocity       : {v_approach:.3f} m/s")
+    print(f"  • Sweeping Trajectory     : fx={freq_x}Hz, fz={freq_z}Hz | Ax={ax*100:.1f}cm, Az={az*100:.1f}cm")
+    print(f"  • Stiffness Gains         : Task Kp={kp_p}, Kd={kd_p} | Tilt Kp={kp_tilt}, Kd={kd_tilt}")
     print("\nMouse Camera Controls (Free Orbit Enabled):")
-    print("  • Left-click + drag:       Rotate / Orbit camera 360° around target")
-    print("  • Right-click + drag / scroll: Zoom in / out")
-    print("  • Shift + Right-click / Middle: Pan camera horizontally / vertically")
-    print("  • Double-click on object:  Focus camera orbit on that body/site")
+    print("  • Left-click + drag       : Rotate / Orbit camera 360° around target")
+    print("  • Right-click + drag      : Zoom in / out")
+    print("  • Shift + Right / Middle  : Pan camera horizontally / vertically")
     print("\nKeyboard Shortcuts:")
-    print("  • Space:                   Pause / Unpause simulation")
-    print("  • '[' and ']':             Cycle between Free Camera & Preset Cameras")
-    print("  • Backspace:               Reset simulation")
-    print("  • Esc / Close window:      Exit")
+    print("  • Space                   : Pause / Unpause simulation")
+    print("  • '[' and ']'             : Cycle between Free Camera & Preset Cameras")
+    print("  • Backspace               : Reset simulation")
+    print("  • Esc / Close window      : Exit")
     print("=" * 65)
 
     with mujoco.viewer.launch_passive(model, data) as viewer:
-        # Initialize in FREE camera mode so mouse drag / orbit / pan / zoom works immediately
         viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
-        viewer.cam.lookat[:] = [-0.15, 0.75, 0.70]  # Focused directly on the sanding workspace
-        viewer.cam.distance = 1.6                   # Optimal viewing distance
-        viewer.cam.azimuth = 135.0                  # 3/4 front perspective
-        viewer.cam.elevation = -15.0                # Slight downward tilt
+        viewer.cam.lookat[:] = [-0.15, 0.75, 0.70]
+        viewer.cam.distance = 1.6
+        viewer.cam.azimuth = 135.0
+        viewer.cam.elevation = -15.0
 
         sim_time = 0.0
 
@@ -451,8 +511,6 @@ def run_gui(duration: float = None, offset: float = 0.10):
                 break
 
             step_start = time.time()
-
-            # Controller step
             tau, f_meas, f_err, p_curr, _, state = controller.compute_torques(sim_time)
             data.ctrl[:] = tau
 
@@ -460,8 +518,6 @@ def run_gui(duration: float = None, offset: float = 0.10):
             sim_time += model.opt.timestep
 
             viewer.sync()
-
-            # Pace simulation to real time
             elapsed = time.time() - step_start
             sleep_time = model.opt.timestep - elapsed
             if sleep_time > 0:
@@ -469,23 +525,90 @@ def run_gui(duration: float = None, offset: float = 0.10):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="UR10e Hybrid Position/Force Sanding Control in MuJoCo")
-    parser.add_argument("--headless", action="store_true", help="Run in headless benchmark mode without GUI")
-    parser.add_argument("--plot", action="store_true", help="Generate performance graph and save to PNG")
-    parser.add_argument("--offset", type=float, default=0.10, help="Initial offset distance from wall in meters (default: 0.10 m)")
-    parser.add_argument("--duration", type=float, default=None, help="Simulation duration in seconds (default: 12.0s for headless, user-closed for GUI)")
+    parser = argparse.ArgumentParser(
+        description="UR10e Hybrid Position/Force Sanding Control in MuJoCo",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+
+    # Execution & Display
+    mode_group = parser.add_argument_group("Execution & Display")
+    mode_group.add_argument("--headless", action="store_true",
+                            help="Run in headless benchmark mode without GUI")
+    mode_group.add_argument("--plot", action="store_true",
+                            help="Generate performance graph and save to PNG")
+    mode_group.add_argument("--plot_name", type=str, default="sanding_performance.png",
+                            help="Filename for the generated performance plot")
+    mode_group.add_argument("--duration", type=float, default=None,
+                            help="Simulation duration in seconds (default: 12.0s for headless, window-close for GUI)")
+
+    # Force & Approach
+    force_group = parser.add_argument_group("Force & Contact Parameters")
+    force_group.add_argument("--force", "-f", type=float, default=1.0,
+                             help="Target normal pressing force against wall (N)")
+    force_group.add_argument("--offset", type=float, default=0.10,
+                             help="Initial standoff offset distance from wall in meters")
+    force_group.add_argument("--v_approach", type=float, default=0.01,
+                             help="Normal approach velocity towards wall (m/s)")
+    force_group.add_argument("--f_thresh", type=float, default=0.30,
+                             help="Force threshold to detect wall contact (N)")
+    force_group.add_argument("--kp_f", type=float, default=0.70,
+                             help="Force PI controller proportional gain")
+    force_group.add_argument("--ki_f", type=float, default=1.80,
+                             help="Force PI controller integral gain")
+    force_group.add_argument("--kd_f", type=float, default=3.50,
+                             help="Force controller normal velocity damping gain")
+
+    # Sweeping Pattern & Gains
+    sweep_group = parser.add_argument_group("Sweeping Trajectory & Stiffness")
+    sweep_group.add_argument("--freq_x", type=float, default=0.04,
+                             help="Horizontal sweep frequency (Hz)")
+    sweep_group.add_argument("--freq_z", type=float, default=0.02,
+                             help="Vertical scan frequency (Hz)")
+    sweep_group.add_argument("--ax", type=float, default=0.04,
+                             help="Horizontal sweep amplitude (m)")
+    sweep_group.add_argument("--az", type=float, default=0.02,
+                             help="Vertical scan amplitude (m)")
+    sweep_group.add_argument("--kp_p", type=float, default=40.0,
+                             help="Tangential position proportional gain (N/m)")
+    sweep_group.add_argument("--kd_p", type=float, default=10.0,
+                             help="Tangential velocity damping (Ns/m)")
+    sweep_group.add_argument("--kp_tilt", type=float, default=100.0,
+                             help="Rotational tilt stiffness for pitch and yaw (Nm/rad)")
+    sweep_group.add_argument("--kd_tilt", type=float, default=12.0,
+                             help="Rotational tilt damping (Nms/rad)")
+
     args = parser.parse_args()
 
+    dur = args.duration if args.duration is not None else 12.0
+
     if args.headless or args.plot:
-        duration = args.duration if args.duration is not None else 12.0
-        run_headless(duration=duration, plot=args.plot, offset=args.offset)
+        run_headless(
+            duration=dur, plot=args.plot, offset=args.offset,
+            force=args.force, v_approach=args.v_approach, f_thresh=args.f_thresh,
+            freq_x=args.freq_x, freq_z=args.freq_z, ax=args.ax, az=args.az,
+            kp_f=args.kp_f, ki_f=args.ki_f, kd_f=args.kd_f,
+            kp_p=args.kp_p, kd_p=args.kd_p, kp_tilt=args.kp_tilt, kd_tilt=args.kd_tilt,
+            plot_name=args.plot_name
+        )
     else:
         try:
-            run_gui(duration=args.duration, offset=args.offset)
+            run_gui(
+                duration=args.duration, offset=args.offset,
+                force=args.force, v_approach=args.v_approach, f_thresh=args.f_thresh,
+                freq_x=args.freq_x, freq_z=args.freq_z, ax=args.ax, az=args.az,
+                kp_f=args.kp_f, ki_f=args.ki_f, kd_f=args.kd_f,
+                kp_p=args.kp_p, kd_p=args.kd_p, kp_tilt=args.kp_tilt, kd_tilt=args.kd_tilt
+            )
         except Exception as e:
             print(f"GUI launch exception (falling back to headless benchmark): {e}")
-            duration = args.duration if args.duration is not None else 12.0
-            run_headless(duration=duration, plot=True, offset=args.offset)
+            run_headless(
+                duration=dur, plot=True, offset=args.offset,
+                force=args.force, v_approach=args.v_approach, f_thresh=args.f_thresh,
+                freq_x=args.freq_x, freq_z=args.freq_z, ax=args.ax, az=args.az,
+                kp_f=args.kp_f, ki_f=args.ki_f, kd_f=args.kd_f,
+                kp_p=args.kp_p, kd_p=args.kd_p, kp_tilt=args.kp_tilt, kd_tilt=args.kd_tilt,
+                plot_name=args.plot_name
+            )
 
 
 if __name__ == "__main__":
