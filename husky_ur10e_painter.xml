@@ -1,4 +1,4 @@
-<mujoco model="husky_ur10e_sander">
+<mujoco model="husky_ur10e_painter">
   <compiler angle="radian" autolimits="true"/>
 
   <option integrator="implicitfast"/>
@@ -110,6 +110,13 @@
     <mesh file="assets/wrist2_1.obj"/>
     <mesh file="assets/wrist2_2.obj"/>
     <mesh file="assets/wrist3.obj"/>
+    <!-- Industrial Spray Paint Gun Materials -->
+    <material name="gun_metal" rgba="0.16 0.18 0.20 1" specular="0.7" shininess="0.5"/>
+    <material name="gun_accent" rgba="0.08 0.55 0.92 1" specular="0.7" shininess="0.5"/>
+    <material name="brass_fitting" rgba="0.85 0.70 0.22 1" specular="0.9" shininess="0.8"/>
+    <material name="chrome_nozzle" rgba="0.88 0.90 0.94 1" specular="0.95" shininess="0.9"/>
+    <material name="paint_mist" rgba="0.05 0.75 1.0 0.40" specular="0.1" shininess="0.05"/>
+    <mesh name="spray_fan_mesh" file="assets/spray_fan.obj"/>
   </asset>
 
   <worldbody>
@@ -235,25 +242,40 @@
                       <geom class="eef_collision" pos="0 0.097 0" quat="1 1 0 0" size="0.046 0.02"/>
                       <site name="attachment_site" pos="0 0.1 0" quat="-1 1 0 0"/>
 
-                      <!-- Circular End-Effector: Industrial Sanding Mount -->
-                      <body name="sander_mount" pos="0 0.1 0" quat="-1 1 0 0">
-                        <inertial pos="0 0 0.045" mass="0.5" diaginertia="0.0008 0.0008 0.0012"/>
+                      <!-- Industrial Airless Spray Painting Gun End-Effector -->
+                      <body name="paint_gun_mount" pos="0 0.1 0" quat="-1 1 0 0">
+                        <inertial pos="0 0 0.045" mass="0.45" diaginertia="0.0006 0.0007 0.0010"/>
+
                         <!-- Flange mounting adapter plate -->
-                        <geom name="sander_adapter" type="cylinder" pos="0 0 0.008" size="0.045 0.008" material="jointgray" contype="0" conaffinity="0"/>
-                        <!-- Spindle motor housing -->
-                        <geom name="sander_housing" type="cylinder" pos="0 0 0.038" size="0.038 0.022" material="black" contype="0" conaffinity="0"/>
-                        <geom name="sander_accent_ring" type="cylinder" pos="0 0 0.062" size="0.040 0.002" material="urblue" contype="0" conaffinity="0"/>
-                        <!-- Circular Backing Pad (150mm diameter orbital sander pad) -->
-                        <geom name="sander_backing_pad" type="cylinder" pos="0 0 0.072" size="0.075 0.008" material="rubber_pad" contype="0" conaffinity="0"/>
-                        <!-- Sandpaper Abrasive Disc (Visual) -->
-                        <geom name="sander_disc_vis" type="cylinder" pos="0 0 0.082" size="0.075 0.002" material="sandpaper" contype="0" conaffinity="0"/>
-                        <!-- Sandpaper Contact Disc (Collision) -->
-                        <geom name="sander_disc_col" type="cylinder" pos="0 0 0.082" size="0.070 0.002"
-                              contype="1" conaffinity="1" solref="0.02 1.0" solimp="0.01 0.95 0.005 0.5 2" friction="0.04 0.005 0.0001"/>
-                        <!-- Tool Center Point (TCP) site at front contact face -->
-                        <site name="tcp" pos="0 0 0.084" size="0.006" rgba="0 1 0 1"/>
-                        <!-- Touch Sensor Site for force measurement -->
-                        <site name="sander_touch" type="cylinder" pos="0 0 0.083" size="0.075 0.004" rgba="1 0.5 0 0.2"/>
+                        <geom name="gun_adapter" type="cylinder" pos="0 0 0.008" size="0.045 0.008" material="jointgray" contype="0" conaffinity="0"/>
+
+                        <!-- Main spray gun body / manifold -->
+                        <geom name="gun_body" type="box" pos="0 0 0.038" size="0.024 0.022 0.022" material="gun_metal" contype="0" conaffinity="0"/>
+                        <geom name="gun_accent_band" type="cylinder" pos="0 0 0.060" size="0.025 0.003" material="gun_accent" contype="0" conaffinity="0"/>
+
+                        <!-- Pneumatic trigger cylinder actuator on top -->
+                        <geom name="pneumatic_actuator" type="cylinder" pos="0 0.028 0.038" size="0.012 0.018" material="gun_metal" contype="0" conaffinity="0"/>
+
+                        <!-- High-pressure fluid feed inlet & brass fitting block below -->
+                        <geom name="fluid_fitting_block" type="box" pos="0 -0.026 0.032" size="0.012 0.012 0.012" material="brass_fitting" contype="0" conaffinity="0"/>
+                        <geom name="paint_hose_coupler" type="cylinder" pos="0 -0.038 0.032" quat="0.7071 0.7071 0 0" size="0.007 0.012" material="brass_fitting" contype="0" conaffinity="0"/>
+
+                        <!-- Spray gun nozzle barrel -->
+                        <geom name="gun_barrel" type="cylinder" pos="0 0 0.075" size="0.014 0.012" material="gun_metal" contype="0" conaffinity="0"/>
+
+                        <!-- Atomizing air cap & spray tip nozzle (brass/chrome) -->
+                        <geom name="nozzle_air_cap" type="cylinder" pos="0 0 0.092" size="0.012 0.006" material="chrome_nozzle" contype="0" conaffinity="0"/>
+                        <!-- Atomizing air horns (twin shaping jets for flat fan pattern) -->
+                        <geom name="air_horn_left"  type="cylinder" pos="0  0.010 0.096" size="0.0025 0.004" material="brass_fitting" contype="0" conaffinity="0"/>
+                        <geom name="air_horn_right" type="cylinder" pos="0 -0.010 0.096" size="0.0025 0.004" material="brass_fitting" contype="0" conaffinity="0"/>
+
+                        <!-- Tool Center Point (TCP) site at front nozzle orifice -->
+                        <site name="tcp" pos="0 0 0.096" size="0.006" rgba="0 1 0 1"/>
+                        <site name="paint_tcp" pos="0 0 0.096" size="0.006" rgba="0 0.8 1 1"/>
+
+                        <!-- Atomized Spray Fan Cone: Semi-transparent visual projection hitting the wall -->
+                        <geom name="spray_cone_vis" type="mesh" mesh="spray_fan_mesh" pos="0 0 0.096"
+                              material="paint_mist" contype="0" conaffinity="0"/>
                       </body>
                     </body>
                   </body>
@@ -283,9 +305,8 @@
     <motor name="wrist_3" joint="wrist_3_joint" ctrlrange="-56 56"/>
   </actuator>
 
-  <!-- Sensors for Force Regulation, Touch, and Telemetry -->
+  <!-- Sensors for Recoil Force Regulation, Pose, and Telemetry -->
   <sensor>
-    <touch name="sander_touch_sensor" site="sander_touch"/>
     <force name="tcp_force_sensor" site="tcp"/>
     <torque name="tcp_torque_sensor" site="tcp"/>
     <accelerometer name="imu_accel" site="imu"/>
