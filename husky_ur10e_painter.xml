@@ -82,6 +82,12 @@
     <material name="sandpaper" rgba="0.82 0.38 0.18 1" specular="0.1" shininess="0.05"/>
     <material name="rubber_pad" rgba="0.12 0.12 0.12 1" specular="0.2" shininess="0.1"/>
 
+    <!-- Industrial Telescopic Column Materials -->
+    <material name="machined_aluminum" rgba="0.82 0.84 0.86 1" specular="0.8" shininess="0.6"/>
+    <material name="seal_amber" rgba="0.95 0.65 0.05 1" specular="0.6" shininess="0.4"/>
+    <material name="linear_rail_steel" rgba="0.88 0.90 0.94 1" specular="0.95" shininess="0.9"/>
+    <material name="status_green" rgba="0.10 0.90 0.30 1" emission="0.6" specular="0.8" shininess="0.5"/>
+
     <!-- Husky Meshes (from Huskyassets/meshes) -->
     <mesh name="base_link_mesh" file="Huskyassets/meshes/base_link.stl"/>
     <mesh name="top_plate_mesh" file="Huskyassets/meshes/top_plate.stl"/>
@@ -172,17 +178,75 @@
         <geom name="rear_right_wheel_col" class="wheel"/>
       </body>
 
-      <!-- Industrial Aluminum Pedestal / Riser Column (Mounted firmly on top deck at x = 0.05 m) -->
-      <body name="ur10e_pedestal" pos="0.05 0 0.225">
-        <!-- Visual Pedestal Structure -->
-        <geom type="cylinder" size="0.13 0.008" pos="0 0 0.008" material="pedestal_dark" contype="0" conaffinity="0" group="2"/>
-        <geom type="cylinder" size="0.085 0.046" pos="0 0 0.062" material="pedestal_col" contype="0" conaffinity="0" group="2"/>
-        <geom type="cylinder" size="0.115 0.008" pos="0 0 0.116" material="pedestal_dark" contype="0" conaffinity="0" group="2"/>
-        <!-- Collision Pedestal Cylinder -->
-        <geom class="husky_collision" type="cylinder" size="0.13 0.062" pos="0 0 0.062"/>
+      <!-- ========================================================================= -->
+      <!-- Industrial Precision Telescopic Elevator Column (0.0 to 1.20 m Stroke)   -->
+      <!-- Ewellix / Linak Style Modular Collaborative Robotic Lifting Column       -->
+      <!-- ========================================================================= -->
+      <body name="linear_lift_base" pos="0.05 0 0.225">
+        <!-- 1. Heavy-Duty CNC Deck Mounting Base Flange -->
+        <geom name="base_flange_plate" type="cylinder" size="0.148 0.008" pos="0 0 0.008" material="pedestal_dark" contype="0" conaffinity="0" group="2"/>
+        <geom name="base_flange_chamfer" type="cylinder" size="0.138 0.004" pos="0 0 0.016" material="machined_aluminum" contype="0" conaffinity="0" group="2"/>
+        <!-- Mounting Bolt Pattern -->
+        <geom name="bolt_f1" type="cylinder" size="0.006 0.004" pos="0.125 0.05 0.018" material="linear_rail_steel" contype="0" conaffinity="0" group="2"/>
+        <geom name="bolt_f2" type="cylinder" size="0.006 0.004" pos="0.125 -0.05 0.018" material="linear_rail_steel" contype="0" conaffinity="0" group="2"/>
+        <geom name="bolt_r1" type="cylinder" size="0.006 0.004" pos="-0.125 0.05 0.018" material="linear_rail_steel" contype="0" conaffinity="0" group="2"/>
+        <geom name="bolt_r2" type="cylinder" size="0.006 0.004" pos="-0.125 -0.05 0.018" material="linear_rail_steel" contype="0" conaffinity="0" group="2"/>
+        <geom name="bolt_l1" type="cylinder" size="0.006 0.004" pos="0 0.135 0.018" material="linear_rail_steel" contype="0" conaffinity="0" group="2"/>
+        <geom name="bolt_l2" type="cylinder" size="0.006 0.004" pos="0 -0.135 0.018" material="linear_rail_steel" contype="0" conaffinity="0" group="2"/>
 
-        <!-- Universal Robots UR10e 6-DOF Manipulator Assembly (Top of Pedestal z = 0.124 m) -->
-        <body name="ur_base" pos="0 0 0.124" quat="0 0 0 -1" childclass="ur10e">
+        <!-- 2. Four Triangular Corner Structural Stiffener Gussets -->
+        <geom name="gusset_front_l" type="box" size="0.012 0.024 0.040" pos="0.095 0.080 0.048" quat="0.92388 0 0 0.38268" material="pedestal_dark" contype="0" conaffinity="0" group="2"/>
+        <geom name="gusset_front_r" type="box" size="0.012 0.024 0.040" pos="0.095 -0.080 0.048" quat="0.92388 0 0 -0.38268" material="pedestal_dark" contype="0" conaffinity="0" group="2"/>
+        <geom name="gusset_rear_l" type="box" size="0.012 0.024 0.040" pos="-0.095 0.080 0.048" quat="0.38268 0 0 0.92388" material="pedestal_dark" contype="0" conaffinity="0" group="2"/>
+        <geom name="gusset_rear_r" type="box" size="0.012 0.024 0.040" pos="-0.095 -0.080 0.048" quat="0.38268 0 0 -0.92388" material="pedestal_dark" contype="0" conaffinity="0" group="2"/>
+
+        <!-- 3. Heavy-Duty Extruded Pillar Housing Profile (Matte Charcoal) -->
+        <geom name="pillar_housing_main" type="box" size="0.102 0.102 0.048" pos="0 0 0.064" material="pedestal_dark" contype="0" conaffinity="0" group="2"/>
+        <geom name="pillar_housing_chamfer" type="box" size="0.082 0.082 0.048" quat="0.92388 0 0 0.38268" pos="0 0 0.064" material="pedestal_dark" contype="0" conaffinity="0" group="2"/>
+        <!-- Rear Drive Electronics & Motor Junction Enclosure -->
+        <geom name="drive_junction_box" type="box" size="0.024 0.055 0.040" pos="-0.120 0 0.060" material="chassis_black" contype="0" conaffinity="0" group="2"/>
+        <geom name="drive_status_led" type="sphere" size="0.005" pos="-0.145 0.035 0.080" material="status_green" contype="0" conaffinity="0" group="2"/>
+
+        <!-- 4. Machined Aluminum Collar & Safety Wiper Seal -->
+        <geom name="housing_top_collar" type="box" size="0.106 0.106 0.006" pos="0 0 0.114" material="machined_aluminum" contype="0" conaffinity="0" group="2"/>
+        <geom name="housing_wiper_seal" type="box" size="0.100 0.100 0.003" pos="0 0 0.120" material="seal_amber" contype="0" conaffinity="0" group="2"/>
+
+        <!-- Telescoping Elevator Carriage (Vertical Prismatic Joint) -->
+        <body name="lift_carriage" pos="0 0 0.124">
+          <inertial pos="0 0 0.08" mass="8.5" diaginertia="0.06 0.06 0.04"/>
+          <!-- Prismatic Slide Joint along Z with 1.2m Stroke Range -->
+          <joint name="prismatic_lift_joint" type="slide" axis="0 0 1" range="0.0 1.20" damping="60.0" armature="1.5"/>
+
+          <!-- =============================================================== -->
+          <!-- Sleek Full-Length Continuous Telescoping Mast Column (1.35m L)  -->
+          <!-- Extends downward from carriage, ensuring ZERO mid-air gaps      -->
+          <!-- =============================================================== -->
+          <!-- 1. Central Extruded Structural Mast (Satin Anodized Aluminum) -->
+          <geom name="mast_spine_main" type="box" size="0.076 0.076 0.675" pos="0 0 -0.675" material="pedestal_col" contype="0" conaffinity="0" group="2"/>
+          <geom name="mast_spine_chamfer" type="box" size="0.060 0.060 0.675" quat="0.92388 0 0 0.38268" pos="0 0 -0.675" material="pedestal_col" contype="0" conaffinity="0" group="2"/>
+
+          <!-- 2. Dual Precision Hardened Chrome Linear Guide Rails (Left & Right) -->
+          <geom name="guide_rail_left" type="box" size="0.006 0.012 0.675" pos="0 0.080 -0.675" material="linear_rail_steel" contype="0" conaffinity="0" group="2"/>
+          <geom name="guide_rail_right" type="box" size="0.006 0.012 0.675" pos="0 -0.080 -0.675" material="linear_rail_steel" contype="0" conaffinity="0" group="2"/>
+
+          <!-- 3. Heavy-Duty Ground Precision Ballscrew Spindle (Front Center Channel) -->
+          <geom name="ballscrew_spindle" type="cylinder" size="0.012 0.675" pos="0.066 0 -0.675" material="chrome_nozzle" contype="0" conaffinity="0" group="2"/>
+
+          <!-- 4. Front & Rear Recessed Anodized Carbon Accent Channels -->
+          <geom name="mast_accent_front" type="box" size="0.001 0.040 0.670" pos="0.077 0 -0.675" material="chassis_black" contype="0" conaffinity="0" group="2"/>
+          <geom name="mast_accent_rear" type="box" size="0.001 0.040 0.670" pos="-0.077 0 -0.675" material="chassis_black" contype="0" conaffinity="0" group="2"/>
+
+          <!-- 5. Carriage Head Mounting Plate & Recirculating Bearing Trucks -->
+          <geom name="carriage_truck_l" type="box" size="0.022 0.020 0.028" pos="0 0.082 -0.014" material="gun_accent" contype="0" conaffinity="0" group="2"/>
+          <geom name="carriage_truck_r" type="box" size="0.022 0.020 0.028" pos="0 -0.082 -0.014" material="gun_accent" contype="0" conaffinity="0" group="2"/>
+          <!-- Heavy-Duty CNC Manipulator Base Flange Adapter -->
+          <geom name="carriage_base_plate" type="cylinder" size="0.138 0.008" pos="0 0 0.004" material="pedestal_dark" contype="0" conaffinity="0" group="2"/>
+          <geom name="carriage_beveled_ring" type="cylinder" size="0.128 0.004" pos="0 0 0.010" material="machined_aluminum" contype="0" conaffinity="0" group="2"/>
+          <!-- Cable Carrier Drag Chain Mounting Bracket -->
+          <geom name="cable_carrier_bracket" type="box" size="0.030 0.042 0.018" pos="-0.096 0 0.008" material="chassis_black" contype="0" conaffinity="0" group="2"/>
+
+          <!-- Universal Robots UR10e 6-DOF Manipulator Assembly (Mounted on Lift Carriage) -->
+          <body name="ur_base" pos="0 0 0.012" quat="0 0 0 -1" childclass="ur10e">
           <inertial mass="4.0" pos="0 0 0" diaginertia="0.0061063308908 0.0061063308908 0.01125"/>
           <geom mesh="base_0" material="black" class="ur_visual"/>
           <geom mesh="base_1" material="jointgray" class="ur_visual"/>
@@ -286,15 +350,19 @@
         </body>
       </body>
     </body>
+    </body>
   </worldbody>
 
-  <!-- Actuators: 4 Wheel Velocity Drives + 6 Direct Torque Motors for Arm Hybrid Control -->
+  <!-- Actuators: 4 Wheel Velocity Drives + 1 Telescopic Linear Lift Motor + 6 Arm Direct Torque Motors -->
   <actuator>
     <!-- Husky 4-Wheel Skid-Steer Velocity Actuators -->
     <velocity name="front_left_wheel_ctrl" joint="front_left_wheel" kv="45" ctrlrange="-20 20" forcerange="-65 65"/>
     <velocity name="front_right_wheel_ctrl" joint="front_right_wheel" kv="45" ctrlrange="-20 20" forcerange="-65 65"/>
     <velocity name="rear_left_wheel_ctrl" joint="rear_left_wheel" kv="45" ctrlrange="-20 20" forcerange="-65 65"/>
     <velocity name="rear_right_wheel_ctrl" joint="rear_right_wheel" kv="45" ctrlrange="-20 20" forcerange="-65 65"/>
+
+    <!-- Telescopic Prismatic Lift Linear Motor (Vertical Force +/- 1500 N) -->
+    <motor name="lift_motor" joint="prismatic_lift_joint" ctrlrange="-1500 1500"/>
 
     <!-- UR10e 6-DOF Direct Torque Motors for Hybrid Position/Force Control -->
     <motor name="shoulder_pan" joint="shoulder_pan_joint" ctrlrange="-330 330"/>
@@ -305,8 +373,10 @@
     <motor name="wrist_3" joint="wrist_3_joint" ctrlrange="-56 56"/>
   </actuator>
 
-  <!-- Sensors for Recoil Force Regulation, Pose, and Telemetry -->
+  <!-- Sensors for Recoil Force Regulation, Pose, Lift & Telemetry -->
   <sensor>
+    <jointpos name="lift_pos" joint="prismatic_lift_joint"/>
+    <jointvel name="lift_vel" joint="prismatic_lift_joint"/>
     <force name="tcp_force_sensor" site="tcp"/>
     <torque name="tcp_torque_sensor" site="tcp"/>
     <accelerometer name="imu_accel" site="imu"/>
