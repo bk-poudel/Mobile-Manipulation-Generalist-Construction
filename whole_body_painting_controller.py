@@ -64,14 +64,15 @@ class WholeBodyPaintingController:
     def __init__(self, model: mujoco.MjModel, data: mujoco.MjData,
                  base_speed: float = 0.03, standoff: float = 0.20,
                  recoil_force: float = 3.50, compensate_recoil: bool = True,
-                 ee_speed: float = 0.12, fan_width: float = 0.15,
+                 ee_speed: float = 0.08, fan_width: float = 0.15,
                  overlap: float = 0.25, z_min: float = 0.65, z_max: float = 2.55,
                  kp_y: float = 280.0, kd_y: float = 35.0, ki_recoil: float = 120.0,
                  kp_p: float = 65.0, kd_p: float = 15.0,
                  kp_tilt: float = 600.0, kd_tilt: float = 40.0,
                  kp_null: float = 12.0, d_null: float = 2.5,
                  adaptive_base_speed: bool = True,
-                 v_lift_max: float = 0.08, a_lift_max: float = 0.25):
+                 v_lift_max: float = 0.08, a_lift_max: float = 0.25,
+                 v_ramp: float = None):
         self.model = model
         self.data = data
         self.dt = model.opt.timestep
@@ -148,13 +149,17 @@ class WholeBodyPaintingController:
         self.z_max = z_max
         self.stroke_z = self.z_max - self.z_min
         self.z_mid = (self.z_max + self.z_min) / 2.0
+        self.z_arm_max = 1.50                 # Upper reach limit of UR10e arm alone (m)
+
+        # Constant Velocity Trajectory Specifications
+        self.ee_speed = ee_speed              # Constant vertical stroke speed for EE (m/s)
+        self.v_ramp_user = v_ramp             # Optional user-specified constant ramp velocity (m/s)
 
         # Swath & Overlap Geometry
         self.fan_width = fan_width            # Swath width of spray cone (m)
         self.overlap = overlap                # Swath overlap ratio (e.g. 25%)
         self.d_shift = self.fan_width * (1.0 - self.overlap)  # Shift per pass (m)
         self.shift_ratio = 0.20               # 20% of pass time for shift, 80% for stroke
-        self.ee_speed = ee_speed              # Target vertical stroke speed (m/s)
 
         self.update_timing()
         self.x_rel_nominal = 0.05             # Nominal tool lead relative to base (+5 cm)
@@ -173,7 +178,6 @@ class WholeBodyPaintingController:
         self.w_lift_nominal = 180.0           # Heavy penalty in normal reach (lift locked)
         self.w_lift_floor = 25.0              # Substantial velocity penalty floor at high reach
         self.w_arm = np.array([1.0, 1.2, 1.0, 0.5, 0.5, 0.4])
-        self.z_arm_max = 1.50                 # Upper reach limit of UR10e arm alone (m)
         self.lambda_damping = 1e-4
 
         # Lift Linear Velocity & Acceleration Limits (Prevents Snapping)
@@ -205,14 +209,58 @@ class WholeBodyPaintingController:
         self.x_start_paint = 0.0
 
     def update_timing(self):
-        """Coordinate pass period with base speed and end-effector stroke velocity."""
-        # Vertical stroke duration from requested ee_speed
+        """
+        Coordinate pass period with base speed, constant EE stroke velocity,
+        and synchronized constant ramp velocity.
+        """
+        # Vertical stroke duration from requested constant ee_speed
         t_vert_req = self.stroke_z / max(1e-4, self.ee_speed)
         # Coordinate pass duration with mobile base forward shift:
         t_pass_base = self.d_shift / max(1e-4, self.base_speed)
         self.t_pass = max(t_vert_req / (1.0 - self.shift_ratio), t_pass_base)
         self.t_shift = self.shift_ratio * self.t_pass
         self.t_vert = self.t_pass - self.t_shift
+
+        # Smooth turnaround blend duration (t_b): 350 ms ensures C1 smooth reversals
+        self.t_b = min(0.35, 0.10 * self.t_vert)
+        # Flat constant velocity plateau for EE:
+        self.v_ee_const = self.stroke_z / max(1e-4, self.t_vert - self.t_b)
+
+        # Ramp stroke required to paint extended tall canvas:
+        self.q_lift_stroke = float(np.clip(self.z_max - self.z_arm_max, 0.0, 1.15))
+        if self.v_ramp_user is not None and self.v_ramp_user > 0.0:
+            self.v_ramp_const = self.v_ramp_user
+            self.q_lift_stroke = float(np.clip(self.v_ramp_const * (self.t_vert - self.t_b), 0.0, 1.20))
+        else:
+            self.v_ramp_const = self.q_lift_stroke / max(1e-4, self.t_vert - self.t_b)
+
+    @staticmethod
+    def get_trapezoidal_profile(tau: float, T: float, stroke: float, v_const: float, t_b: float = 0.35):
+        """
+        Evaluate a trapezoidal motion profile with smooth half-cosine C1 blends at turnaround.
+        Guarantees that for tau in [t_b, T - t_b], velocity is strictly constant: v == v_const.
+        Returns: (pos, vel)
+        """
+        tau = float(np.clip(tau, 0.0, T))
+        if stroke <= 1e-6:
+            return 0.0, 0.0
+        if tau < t_b:
+            frac = 0.5 * (1.0 - np.cos(np.pi * tau / t_b))
+            v = v_const * frac
+            pos = v_const * (0.5 * tau - 0.5 * (t_b / np.pi) * np.sin(np.pi * tau / t_b))
+        elif tau <= T - t_b:
+            pos_b = 0.5 * v_const * t_b
+            pos = pos_b + v_const * (tau - t_b)
+            v = v_const
+        else:
+            tau_rem = T - tau
+            frac = 0.5 * (1.0 - np.cos(np.pi * tau_rem / t_b))
+            v = v_const * frac
+            pos_b = 0.5 * v_const * t_b
+            pos_const = v_const * (T - 2.0 * t_b)
+            pos_dec = 0.5 * v_const * t_b - v_const * (0.5 * tau_rem - 0.5 * (t_b / np.pi) * np.sin(np.pi * tau_rem / t_b))
+            pos = pos_b + pos_const + pos_dec
+        return float(pos), float(v)
 
     def init_paint_engine(self):
         """Index the 1080 paintable wall tiles and initialize paint deposition state."""
@@ -409,34 +457,39 @@ class WholeBodyPaintingController:
             if self.gun_body_id >= 0:
                 self.data.xfrc_applied[self.gun_body_id, :3] = 0.0
 
-        # 3. Trajectory Generation (Digital Signal Square-Wave Rastering across Extended Wall)
+        # 3. Trajectory Generation (Constant Velocity Digital Signal Square-Wave Rastering)
         if self.state == "APPROACH":
             x_des = self.data.qpos[0] + self.x_rel_nominal
             vx_des = 0.0
             z_des = self.z_min
             vz_des = 0.0
+            ql_des = 0.0
+            vql_des = 0.0
             self.sub_state = "APPROACH"
         else:
             tau = sim_time - self.t_start_paint
             pass_idx = int(tau / self.t_pass)
             tau_pass = tau - pass_idx * self.t_pass
             x_k = self.x_start_paint + pass_idx * self.d_shift
-            stroke_len = self.z_max - self.z_min
 
             if tau_pass <= self.t_vert:
-                # Vertical stroke phase (pure vertical edge in digital signal)
-                s = 0.5 * (1.0 - np.cos(np.pi * tau_pass / self.t_vert))
-                ds = (0.5 * np.pi / self.t_vert) * np.sin(np.pi * tau_pass / self.t_vert)
+                # Vertical stroke phase (Constant Velocity Profile with Smooth Turnaround Blends)
+                s_pos, s_vel = self.get_trapezoidal_profile(tau_pass, self.t_vert, self.stroke_z, self.v_ee_const, self.t_b)
+                s_ql_pos, s_ql_vel = self.get_trapezoidal_profile(tau_pass, self.t_vert, self.q_lift_stroke, self.v_ramp_const, self.t_b)
 
                 if pass_idx % 2 == 0:
-                    # Even pass: Move UP (z_min -> z_max)
-                    z_des = self.z_min + s * stroke_len
-                    vz_des = ds * stroke_len
+                    # Even pass: Move UP (z_min -> z_max, ql 0 -> q_lift_stroke)
+                    z_des = self.z_min + s_pos
+                    vz_des = s_vel
+                    ql_des = s_ql_pos
+                    vql_des = s_ql_vel
                     self.sub_state = f"P{pass_idx}_UP"
                 else:
-                    # Odd pass: Move DOWN (z_max -> z_min)
-                    z_des = self.z_max - s * stroke_len
-                    vz_des = -ds * stroke_len
+                    # Odd pass: Move DOWN (z_max -> z_min, ql q_lift_stroke -> 0)
+                    z_des = self.z_max - s_pos
+                    vz_des = -s_vel
+                    ql_des = self.q_lift_stroke - s_ql_pos
+                    vql_des = -s_ql_vel
                     self.sub_state = f"P{pass_idx}_DOWN"
 
                 x_des = x_k
@@ -452,9 +505,12 @@ class WholeBodyPaintingController:
 
                 if pass_idx % 2 == 0:
                     z_des = self.z_max
+                    ql_des = self.q_lift_stroke
                 else:
                     z_des = self.z_min
+                    ql_des = 0.0
                 vz_des = 0.0
+                vql_des = 0.0
                 self.sub_state = f"P{pass_idx}_SHIFT"
 
         # 4. Adaptive Mobile Base Speed Governor
@@ -549,19 +605,14 @@ class WholeBodyPaintingController:
 
         dq_sys_cmd = Jw_pinv @ v_cmd_6d + Nw @ dq_0
 
-        # Lift Velocity & Acceleration Slew-Rate Limiter (Prevents Any Instantaneous Snapping)
-        v_lift_raw = float(dq_sys_cmd[0])
-        v_lift_bounded = float(np.clip(v_lift_raw, -self.v_lift_max, self.v_lift_max))
-        dv_lift = float(np.clip(v_lift_bounded - self.v_lift_filtered, -self.a_lift_max * self.dt, self.a_lift_max * self.dt))
-        self.v_lift_filtered += dv_lift
-        self.q_lift_cmd += self.v_lift_filtered * self.dt
-        self.q_lift_cmd = float(np.clip(self.q_lift_cmd, 0.0, 1.20))
-
         # 6. Actuation:
         # A. Prismatic Lift Joint (Actuator 4: 'lift_motor')
-        # High-rigidity vertical servo with full gravity compensation for carriage + UR10e arm
+        # High-rigidity vertical servo with full gravity compensation and velocity feedforward.
+        # Strictly enforces constant ramp velocity (v_ramp_const) without lag or jerk.
+        self.q_lift_cmd = ql_des
+        self.v_lift_filtered = vql_des
         tau_lift_bias = self.data.qfrc_bias[10]
-        tau_lift = self.kp_lift * (self.q_lift_cmd - self.data.qpos[11]) - self.kd_lift * self.data.qvel[10] + tau_lift_bias
+        tau_lift = self.kp_lift * (self.q_lift_cmd - self.data.qpos[11]) + self.kd_lift * (self.v_lift_filtered - self.data.qvel[10]) + tau_lift_bias
         self.data.ctrl[self.lift_act_id] = np.clip(tau_lift, -1500, 1500)
 
         # B. 6-DOF UR10e Arm Operational Space Impedance Controller (Actuators 5..10)
@@ -611,11 +662,12 @@ class WholeBodyPaintingController:
 def run_headless_benchmark(duration: float = 35.0, plot: bool = True,
                            speed: float = 0.03, standoff: float = 0.20,
                            recoil: float = 3.50, compensate: bool = True,
-                           ee_speed: float = 0.12, fan_width: float = 0.15,
+                           ee_speed: float = 0.08, fan_width: float = 0.15,
                            overlap: float = 0.25, z_min: float = 0.65, z_max: float = 2.55,
                            kp_y: float = 280.0, kd_y: float = 35.0,
                            adaptive_base_speed: bool = True,
                            v_lift_max: float = 0.08, a_lift_max: float = 0.25,
+                           v_ramp: float = None,
                            plot_name: str = "whole_body_painting_performance.png"):
     """Execute high-speed headless evaluation and log full painting metrics."""
     scene_path = os.path.join(os.path.dirname(__file__), "scene_husky_painting.xml")
@@ -629,7 +681,8 @@ def run_headless_benchmark(duration: float = 35.0, plot: bool = True,
         fan_width=fan_width, overlap=overlap, z_min=z_min, z_max=z_max,
         kp_y=kp_y, kd_y=kd_y,
         adaptive_base_speed=adaptive_base_speed,
-        v_lift_max=v_lift_max, a_lift_max=a_lift_max
+        v_lift_max=v_lift_max, a_lift_max=a_lift_max,
+        v_ramp=v_ramp
     )
     controller.initialize_posture(start_x=-1.5)
 
@@ -638,6 +691,7 @@ def run_headless_benchmark(duration: float = 35.0, plot: bool = True,
     print(f"Wall Dimensions      : 6.0 m Length x 3.2 m Height | Painting Canvas: 5.4 m x 2.0 m")
     print(f"Vertical Stroke Range: [{z_min:.2f} m, {z_max:.2f} m] (Stroke: {(z_max - z_min)*100:.1f} cm)")
     print(f"Prismatic Lift Joint : Range [0.0, 1.20 m] | Penalized W-IK (w_nom={controller.w_lift_nominal:.0f}, floor={controller.w_lift_floor:.0f})")
+    print(f"Constant Speeds      : EE Speed = {controller.ee_speed*1000.0:.1f} mm/s (Plateau: {controller.v_ee_const*1000.0:.1f} mm/s) | Ramp Speed = {controller.v_ramp_const*1000.0:.1f} mm/s")
     print(f"Lift Velocity Limits : Max v_lift = {v_lift_max*1000.0:.0f} mm/s, a_lift = {a_lift_max:.2f} m/s^2 (Smooth, Slew-Rate Limited)")
     print(f"Adaptive Base Speed  : {'ENABLED' if adaptive_base_speed else 'DISABLED'} (Max: {speed*1000.0:.1f} mm/s, Governor Throttles on Lag/Error)")
     print(f"Target Standoff Dist : {standoff * 100:.1f} cm ({standoff:.3f} m from wall at Y = 0.80 m)")
@@ -664,6 +718,7 @@ def run_headless_benchmark(duration: float = 35.0, plot: bool = True,
     target_zs = []
     lifts = []
     v_lifts = []
+    v_tcp_zs = []
     lags = []
     tilts = []
     coverages = []
@@ -681,6 +736,8 @@ def run_headless_benchmark(duration: float = 35.0, plot: bool = True,
         cos_theta = np.clip(R_curr[:, 2] @ np.array([0.0, 1.0, 0.0]), -1.0, 1.0)
         tilt_deg = float(np.degrees(np.arccos(cos_theta)))
 
+        v_tcp = (controller.jacp @ data.qvel).copy()
+
         times.append(t_sim)
         standoff_errs.append(err_y * 1000.0)  # mm
         recoils_actual.append(f_rec)
@@ -695,6 +752,7 @@ def run_headless_benchmark(duration: float = 35.0, plot: bool = True,
         target_zs.append(p_tgt[2])
         lifts.append(q_lift)
         v_lifts.append(v_lift * 1000.0)  # mm/s
+        v_tcp_zs.append(float(v_tcp[2]) * 1000.0)  # mm/s
         lags.append(e_lag * 1000.0)  # mm
         tilts.append(tilt_deg)
         coverages.append(cov_pct)
@@ -703,7 +761,7 @@ def run_headless_benchmark(duration: float = 35.0, plot: bool = True,
         if step % log_interval == 0 or step == total_steps - 1:
             standoff_actual = (controller.y_wall - p_tcp[1]) * 100.0
             print(f"[t={t_sim:5.2f}s] Phase: {state:10s} | Base X: {base_xs[-1]:5.2f}m (v={base_vs[-1]:4.1f}mm/s, {base_factors[-1]:3.0f}%) | "
-                  f"TCP Z: {p_tcp[2]:5.2f}m | Lift: {q_lift:5.3f}m (v={v_lifts[-1]:+5.1f}mm/s) | "
+                  f"TCP Z: {p_tcp[2]:5.2f}m (vz={v_tcp_zs[-1]:+5.1f}mm/s) | Lift: {q_lift:5.3f}m (v={v_lifts[-1]:+5.1f}mm/s) | "
                   f"Lag: {lags[-1]:+4.1f}mm | Standoff: {standoff_actual:5.2f}cm")
 
     wall_elapsed = time.perf_counter() - t_start_wall
@@ -733,7 +791,8 @@ def run_headless_benchmark(duration: float = 35.0, plot: bool = True,
     print(f"  - Total Base Travel        : {base_xs[-1] - base_xs[0]:.2f} m along 6.0 m wall")
     print(f"  - Adaptive Base Speed Range: [{np.min(base_vs_np):.1f}, {np.max(base_vs_np):.1f}] mm/s (Auto-Governed on Lag & Error)")
     print(f"  - Maximum Arm Lag          : {max_lag:.1f} mm (Within safe lead bounds)")
-    print(f"  - Maximum Lift Velocity    : {max_lift_vel:.1f} mm/s (Smoothly bounded <= {v_lift_max*1000.0:.0f} mm/s limit, zero snapping)")
+    print(f"  - Constant Ramp Velocity   : {controller.v_ramp_const*1000.0:.1f} mm/s (Zero Snapping/Spike)")
+    print(f"  - Constant EE Velocity     : {controller.v_ee_const*1000.0:.1f} mm/s (Smooth & Flat)")
     print(f"  - Maximum Lift Elevation   : {max_lift:.3f} m ({max_lift*100.0:.1f} cm) for high strokes Z > 1.50 m")
     print("=" * 84)
 
@@ -741,7 +800,7 @@ def run_headless_benchmark(duration: float = 35.0, plot: bool = True,
         generate_painting_performance_plot(
             times, standoff_errs, recoils_actual, recoils_est,
             base_xs, base_vs, base_factors, tcp_xs, tcp_zs, target_xs, target_zs,
-            lifts, v_lifts, lags, controller.z_arm_max, speed * 1000.0, v_lift_max * 1000.0,
+            lifts, v_lifts, v_tcp_zs, lags, controller.z_arm_max, speed * 1000.0, v_lift_max * 1000.0,
             controller.tile_x, controller.tile_z, controller.tile_thickness,
             coverages, controller.t_start_paint, standoff,
             plot_name=plot_name
@@ -750,7 +809,7 @@ def run_headless_benchmark(duration: float = 35.0, plot: bool = True,
 
 def generate_painting_performance_plot(times, standoff_errs, recoils_actual, recoils_est,
                                        base_xs, base_vs, base_factors, tcp_xs, tcp_zs, target_xs, target_zs,
-                                       lifts, v_lifts, lags, z_arm_limit, v_base_max_mms, v_lift_max_mms,
+                                       lifts, v_lifts, v_tcp_zs, lags, z_arm_limit, v_base_max_mms, v_lift_max_mms,
                                        tile_x, tile_z, tile_thickness, coverages,
                                        t_start, standoff,
                                        plot_name: str = "whole_body_painting_performance.png"):
@@ -761,7 +820,7 @@ def generate_painting_performance_plot(times, standoff_errs, recoils_actual, rec
 
     fig, axs = plt.subplots(2, 2, figsize=(16, 12))
     fig.suptitle("Whole-Body Mobile Loco-Manipulation Spray Painting Benchmark\n"
-                 "Adaptive Base Speed Governor & Slew-Rate Limited Prismatic Lift",
+                 "Constant EE & Ramp Velocities with Adaptive Base Speed Governor",
                  fontsize=14, fontweight="bold")
 
     # Plot 1: Standoff Distance Tracking Error (Y-axis)
@@ -817,7 +876,7 @@ def generate_painting_performance_plot(times, standoff_errs, recoils_actual, rec
     ax3.grid(True, linestyle="--", alpha=0.4)
     ax3.legend(loc="upper left")
 
-    # Plot 4: Prismatic Lift Position & Smooth Bounded Velocity
+    # Plot 4: Constant Velocity Execution - EE & Ramp Velocities (Zero Snapping/Spike)
     ax4 = axs[1, 1]
     color_lift = "#9467bd"
     ax4.plot(times, lifts, label="Prismatic Lift Position (m)", color=color_lift, lw=2.5)
@@ -829,13 +888,11 @@ def generate_painting_performance_plot(times, standoff_errs, recoils_actual, rec
     ax4.grid(True, linestyle="--", alpha=0.6)
 
     ax4_sub = ax4.twinx()
-    color_vlift = "#17becf"
-    ax4_sub.plot(times, v_lifts, label="Lift Velocity (mm/s)", color=color_vlift, linestyle="--", lw=1.8, alpha=0.85)
-    ax4_sub.axhline(+v_lift_max_mms, color="red", linestyle=":", label=f"Velocity Bound (±{v_lift_max_mms:.0f} mm/s)", lw=1.2)
-    ax4_sub.axhline(-v_lift_max_mms, color="red", linestyle=":", lw=1.2)
-    ax4_sub.set_ylabel("Lift Velocity (mm/s)", color=color_vlift)
-    ax4_sub.tick_params(axis="y", labelcolor=color_vlift)
-    ax4.set_title("4. Prismatic Lift Position & Penalized Slew-Rate Limited Velocity")
+    ax4_sub.plot(times, v_tcp_zs, label="EE Vertical Velocity (mm/s)", color="#ff7f0e", lw=1.8, alpha=0.9)
+    ax4_sub.plot(times, v_lifts, label="Ramp Velocity (mm/s)", color="#17becf", linestyle="--", lw=1.8, alpha=0.85)
+    ax4_sub.axhline(0.0, color="black", linestyle=":", lw=0.8)
+    ax4_sub.set_ylabel("Velocity (mm/s)")
+    ax4.set_title("4. Constant Velocity Motion: EE & Ramp Velocities (Zero Spike)")
 
     lines1, labels1 = ax4.get_legend_handles_labels()
     lines2, labels2 = ax4_sub.get_legend_handles_labels()
@@ -849,12 +906,13 @@ def generate_painting_performance_plot(times, standoff_errs, recoils_actual, rec
 
 def run_interactive_simulation(duration: float = None, speed: float = 0.03,
                                standoff: float = 0.20, recoil: float = 3.50,
-                               compensate: bool = True, ee_speed: float = 0.12,
+                               compensate: bool = True, ee_speed: float = 0.08,
                                fan_width: float = 0.15, overlap: float = 0.25,
                                z_min: float = 0.65, z_max: float = 2.55,
                                kp_y: float = 280.0, kd_y: float = 35.0,
                                adaptive_base_speed: bool = True,
                                v_lift_max: float = 0.08, a_lift_max: float = 0.25,
+                               v_ramp: float = None,
                                start_x: float = -1.5):
     """Launch interactive 3D graphical visualizer with real-time painting on tall wall."""
     import mujoco.viewer
@@ -870,7 +928,8 @@ def run_interactive_simulation(duration: float = None, speed: float = 0.03,
         fan_width=fan_width, overlap=overlap, z_min=z_min, z_max=z_max,
         kp_y=kp_y, kd_y=kd_y,
         adaptive_base_speed=adaptive_base_speed,
-        v_lift_max=v_lift_max, a_lift_max=a_lift_max
+        v_lift_max=v_lift_max, a_lift_max=a_lift_max,
+        v_ramp=v_ramp
     )
     controller.initialize_posture(start_x=start_x)
 
@@ -883,6 +942,7 @@ def run_interactive_simulation(duration: float = None, speed: float = 0.03,
     print(f"  • Standoff Offset (Wall) : {standoff*100:.1f} cm ({standoff:.3f} m from wall)")
     print(f"  • Spray Recoil Thrust    : {recoil:.2f} N (Compensation: {'ACTIVE' if compensate else 'OFF'})")
     print(f"  • Vertical Stroke (Z)    : [{z_min:.2f} m, {z_max:.2f} m] (Stroke: {(z_max - z_min)*100:.1f} cm)")
+    print(f"  • Constant Speeds        : EE Speed = {controller.ee_speed*1000.0:.1f} mm/s | Ramp Speed = {controller.v_ramp_const*1000.0:.1f} mm/s")
     print(f"  • Prismatic Lift Joint   : 0.0 to 1.20 m (Smooth velocity bounded <= {v_lift_max*1000:.0f} mm/s, zero snapping)")
     print("-" * 84)
     print("Interactive Controls:")
@@ -980,8 +1040,10 @@ def main():
     speed_group = parser.add_argument_group("Speeds & Workspace Geometry")
     speed_group.add_argument("--speed", "-s", type=float, default=0.03,
                              help="Husky mobile base maximum cruising speed along the wall (m/s)")
-    speed_group.add_argument("--ee_speed", type=float, default=0.12,
-                             help="Target vertical stroke velocity for spray nozzle (m/s)")
+    speed_group.add_argument("--ee_speed", type=float, default=0.08,
+                             help="Target constant vertical stroke velocity for spray nozzle (m/s)")
+    speed_group.add_argument("--v_ramp", type=float, default=None,
+                             help="Target constant velocity for ramp / prismatic lift (m/s). Defaults to auto-coordinated with stroke.")
     speed_group.add_argument("--z_min", type=float, default=0.65,
                              help="Lower limit of vertical painting stroke (m)")
     speed_group.add_argument("--z_max", type=float, default=2.55,
@@ -1012,6 +1074,7 @@ def main():
             kp_y=args.kp_y, kd_y=args.kd_y,
             adaptive_base_speed=args.adaptive_base,
             v_lift_max=args.v_lift_max, a_lift_max=args.a_lift_max,
+            v_ramp=args.v_ramp,
             plot_name=args.plot_name
         )
     else:
@@ -1023,6 +1086,7 @@ def main():
             kp_y=args.kp_y, kd_y=args.kd_y,
             adaptive_base_speed=args.adaptive_base,
             v_lift_max=args.v_lift_max, a_lift_max=args.a_lift_max,
+            v_ramp=args.v_ramp,
             start_x=args.start_x
         )
 
