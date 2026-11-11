@@ -30,7 +30,7 @@ class CoveragePathPlanner:
     """
 
     def __init__(self,
-                 wall_bounds=(-2.00, 0.40, 3.00, 2.60),
+                 wall_bounds=(-2.45, 0.38, 2.45, 2.52),
                  obstacles=None,
                  spray_width=0.20,
                  overlap_ratio=0.50,
@@ -444,124 +444,147 @@ class CoveragePathPlanner:
             elif obs["type"] == "window":
                 win_inf = obs["inflated_bbox"]
 
-        z_bottom = 0.40  # Reach all the way down to wall canvas base (Z = 0.40 m) to coat row 0 tiles
+        z_bottom = 0.38  # Fully reach wall canvas bottom margin (Z = 0.38 m) to coat row 0 boundary
+        z_top = 2.52     # Fully reach wall canvas top margin (Z = 2.52 m) to coat top row boundary
+        z_win_bot = 0.88  # Clearance below window opening
+        z_win_top = 2.22  # Clearance above window opening
+
+        # Start from the exact bottom-left corner where the arm sits in home position (X = -2.45m, Z = 0.38m)
+        x_start_left = min(-2.45, round(self.wall_bounds[0], 4))
+        x_end_right = max(2.45, round(self.wall_bounds[2], 4))
 
         self.vertical_blocks = [
-            {"id": "Block_1_LeftCol",    "label": "Left Wall Column",     "bbox": [pw_min_x, z_bottom, door_inf[0], 2.50]},
-            {"id": "Block_2_DoorHeader", "label": "Door Header (Top)",   "bbox": [door_inf[0], door_inf[3] + 0.08, door_inf[2], 2.50]},
-            {"id": "Block_3_CenterCol",  "label": "Center Wall Column",   "bbox": [door_inf[2], z_bottom, win_inf[0], 2.50]},
-            {"id": "Block_4_Wainscot",   "label": "Wainscot (Sub-Window)","bbox": [win_inf[0], z_bottom, win_inf[2], win_inf[1] - 0.08]},
-            {"id": "Block_5_RightCol",   "label": "Right Wall Column",    "bbox": [win_inf[2], z_bottom, pw_max_x, 2.50]},
-            {"id": "Block_6_WinHeader",  "label": "Window Header (Top)", "bbox": [win_inf[0], win_inf[3] + 0.08, win_inf[2], 2.50]},
+            {"id": "Block_1_LeftCol",    "label": "Left Wall Column",      "bbox": [x_start_left, z_bottom, door_inf[0], z_top]},
+            {"id": "Block_2_DoorHeader", "label": "Door Header (Top)",    "bbox": [door_inf[0], door_inf[3] + 0.08, door_inf[2], z_top]},
+            {"id": "Block_3_CenterCol",  "label": "Center Wall Column",    "bbox": [door_inf[2], z_bottom, win_inf[0], z_top]},
+            {"id": "Block_4_WindowCol",  "label": "Window Zone (Broken)",  "bbox": [win_inf[0], z_bottom, win_inf[2], z_top]},
+            {"id": "Block_5_RightCol",   "label": "Right Wall Column",     "bbox": [win_inf[2], z_bottom, x_end_right, z_top]},
         ]
 
         raw_pts = []
 
-        def sample_v_pass(x_val, z_s, z_e, phase):
+        def sample_v_pass(x_val, z_s, z_e, phase, spray=True, v_spd=None):
+            spd = v_spd if v_spd is not None else self.target_velocity
             n_pts = max(2, int(np.ceil(abs(z_e - z_s) / dz_sample)) + 1)
             zs = np.linspace(z_s, z_e, n_pts)
-            return [(float(x_val), float(z), self.target_velocity, True, phase) for z in zs]
+            return [(float(x_val), float(z), spd, spray, phase) for z in zs]
 
-        def sample_v_turn(x_s, x_e, z_t, is_top, phase, n_pts=20):
+        def sample_v_turn(x_s, x_e, z_t, is_top, phase, n_pts=20, spray=True):
             P0 = np.array([x_s, z_t])
             P3 = np.array([x_e, z_t])
-            # Keep bottom turns completely flat (dz_inward = 0.0) so the arm does not arch upward away from the bottom wall margin
-            dz_inward = -0.035 if is_top else 0.0
+            # Keep turns flat (dz_inward = 0.0) so the arm does not arch away from vertical boundaries
+            dz_inward = 0.0
             P1 = np.array([x_s, z_t + dz_inward])
             P2 = np.array([x_e, z_t + dz_inward])
             u = np.linspace(0.0, 1.0, n_pts)
             pts = []
             for ui in u:
                 p = (1-ui)**3 * P0 + 3*(1-ui)**2 * ui * P1 + 3*(1-ui) * ui**2 * P2 + ui**3 * P3
-                pts.append((float(p[0]), float(p[1]), self.target_velocity, False, phase))
+                pts.append((float(p[0]), float(p[1]), self.target_velocity, spray, phase))
             return pts
 
         # ---------------------------------------------------------------------
-        # Block 1: Left Column (pw_min_x to door_inf[0])
-        # Start bottom-left (pw_min_x, 0.40) -> Exit top-right (door_inf[0], 2.50)
+        # Block 1: Left Column (x_start_left to door_inf[0])
+        # Start bottom-left (x_start_left, 0.38) -> Exit top-right (door_inf[0], 2.52)
         # ---------------------------------------------------------------------
-        n_b1 = max(2, int(np.round((door_inf[0] - pw_min_x) / 0.08)) + 1)
-        x_b1 = np.linspace(pw_min_x, door_inf[0], n_b1)
+        n_b1 = max(2, int(np.round((door_inf[0] - x_start_left) / 0.08)) + 1)
+        if n_b1 % 2 == 0:
+            n_b1 += 1  # Odd count ensures exit at top Z = z_top
+        x_b1 = np.linspace(x_start_left, door_inf[0], n_b1)
         for i in range(len(x_b1)):
-            zs, ze = (z_bottom, 2.50) if i % 2 == 0 else (2.50, z_bottom)
-            raw_pts.extend(sample_v_pass(x_b1[i], zs, ze, "B1_LeftCol"))
+            zs, ze = (z_bottom, z_top) if i % 2 == 0 else (z_top, z_bottom)
+            raw_pts.extend(sample_v_pass(x_b1[i], zs, ze, "B1_LeftCol", spray=True))
             if i < len(x_b1) - 1:
                 is_top = (i % 2 == 0)
-                zt = 2.50 if is_top else z_bottom
-                raw_pts.extend(sample_v_turn(x_b1[i], x_b1[i+1], zt, is_top, "B1_Turn"))
+                zt = z_top if is_top else z_bottom
+                raw_pts.extend(sample_v_turn(x_b1[i], x_b1[i+1], zt, is_top, "B1_Turn", spray=True))
 
         # ---------------------------------------------------------------------
         # Block 2: Door Header (door_inf[0] to door_inf[2])
-        # Start top-left (door_inf[0], 2.50) -> Exit top-right (door_inf[2], 2.50)
+        # Start top-left (door_inf[0], 2.52) -> Exit top-right (door_inf[2], 2.52)
         # ---------------------------------------------------------------------
         n_b2 = max(2, int(np.round((door_inf[2] - door_inf[0]) / 0.08)) + 1)
+        if n_b2 % 2 != 0:
+            n_b2 += 1  # Even count ensures exit at top Z = z_top
         x_b2 = np.linspace(door_inf[0], door_inf[2], n_b2)
+        # Turn into Door Header at top
+        raw_pts.extend(sample_v_turn(x_b1[-1], x_b2[0], z_top, is_top=True, phase="B1_B2_Turn", n_pts=10, spray=True))
+
         for i in range(len(x_b2)):
-            zs, ze = (2.50, 2.22) if i % 2 == 0 else (2.22, 2.50)
-            raw_pts.extend(sample_v_pass(x_b2[i], zs, ze, "B2_DoorHeader"))
+            zs, ze = (z_top, 2.22) if i % 2 == 0 else (2.22, z_top)
+            raw_pts.extend(sample_v_pass(x_b2[i], zs, ze, "B2_DoorHeader", spray=True))
             if i < len(x_b2) - 1:
                 is_top = (i % 2 == 1)
-                zt = 2.50 if is_top else 2.22
-                raw_pts.extend(sample_v_turn(x_b2[i], x_b2[i+1], zt, is_top, "B2_Turn"))
+                zt = z_top if is_top else 2.22
+                raw_pts.extend(sample_v_turn(x_b2[i], x_b2[i+1], zt, is_top, "B2_Turn", spray=True))
 
         # ---------------------------------------------------------------------
         # Block 3: Center Column (door_inf[2] to win_inf[0])
-        # Start top-left (door_inf[2], 2.50) -> Exit bottom-right (win_inf[0], 0.40)
+        # Start top-left (door_inf[2], 2.52) -> Exit bottom-right (win_inf[0], 0.38)
         # ---------------------------------------------------------------------
         n_b3 = max(2, int(np.round((win_inf[0] - door_inf[2]) / 0.10)) + 1)
+        if n_b3 % 2 == 0:
+            n_b3 += 1  # Odd count ensures pass 0 is downward, exit is at bottom Z = z_bottom
         x_b3 = np.linspace(door_inf[2], win_inf[0], n_b3)
+        # Turn into Center Column at top
+        raw_pts.extend(sample_v_turn(x_b2[-1], x_b3[0], z_top, is_top=True, phase="B2_B3_Turn", n_pts=10, spray=True))
+
         for i in range(len(x_b3)):
-            zs, ze = (2.50, z_bottom) if i % 2 == 0 else (z_bottom, 2.50)
-            raw_pts.extend(sample_v_pass(x_b3[i], zs, ze, "B3_CenterCol"))
+            zs, ze = (z_top, z_bottom) if i % 2 == 0 else (z_bottom, z_top)
+            raw_pts.extend(sample_v_pass(x_b3[i], zs, ze, "B3_CenterCol", spray=True))
             if i < len(x_b3) - 1:
                 is_top = (i % 2 == 1)
-                zt = 2.50 if is_top else z_bottom
-                raw_pts.extend(sample_v_turn(x_b3[i], x_b3[i+1], zt, is_top, "B3_Turn"))
+                zt = z_top if is_top else z_bottom
+                raw_pts.extend(sample_v_turn(x_b3[i], x_b3[i+1], zt, is_top, "B3_Turn", spray=True))
 
         # ---------------------------------------------------------------------
-        # Block 4: Wainscot Sub-Window (win_inf[0] to win_inf[2])
-        # Start bottom-left (win_inf[0], 0.40) -> Exit bottom-right (win_inf[2], 0.40)
+        # Block 4: Window Zone Broken Vertical Sweeps (win_inf[0] to win_inf[2])
+        # In each column x_i across the window:
+        # Sweeps lower wainscot (0.38 to 0.88, SPRAY_ON), transits window opening
+        # (0.88 to 2.22, SPRAY_OFF), and sweeps upper header (2.22 to 2.52, SPRAY_ON).
+        # Seamlessly progresses strictly left-to-right with ZERO backtracking.
         # ---------------------------------------------------------------------
-        n_b4 = max(2, int(np.round((win_inf[2] - win_inf[0]) / 0.10)) + 1)
+        n_b4 = max(2, int(np.round((win_inf[2] - win_inf[0]) / 0.09)) + 1)
+        if n_b4 % 2 != 0:
+            n_b4 += 1  # Even count ensures exit at bottom Z = z_bottom
         x_b4 = np.linspace(win_inf[0], win_inf[2], n_b4)
+        v_transit = 1.8 * self.target_velocity
+        # Turn into Window Zone at bottom
+        raw_pts.extend(sample_v_turn(x_b3[-1], x_b4[0], z_bottom, is_top=False, phase="B3_B4_Turn", n_pts=10, spray=True))
+
         for i in range(len(x_b4)):
-            zs, ze = (z_bottom, 0.88) if i % 2 == 0 else (0.88, z_bottom)
-            raw_pts.extend(sample_v_pass(x_b4[i], zs, ze, "B4_Wainscot"))
-            if i < len(x_b4) - 1:
-                is_top = (i % 2 == 0)
-                zt = 0.88 if is_top else z_bottom
-                raw_pts.extend(sample_v_turn(x_b4[i], x_b4[i+1], zt, is_top, "B4_Turn"))
+            xi = x_b4[i]
+            if i % 2 == 0:
+                # Upward pass: Wainscot (ON) -> Window Transit (OFF) -> Header (ON)
+                raw_pts.extend(sample_v_pass(xi, z_bottom, z_win_bot, "B4_WinLower", spray=True))
+                raw_pts.extend(sample_v_pass(xi, z_win_bot, z_win_top, "B4_WinTransit", spray=False, v_spd=v_transit))
+                raw_pts.extend(sample_v_pass(xi, z_win_top, z_top, "B4_WinUpper", spray=True))
+                if i < len(x_b4) - 1:
+                    raw_pts.extend(sample_v_turn(x_b4[i], x_b4[i+1], z_top, is_top=True, phase="B4_TurnTop", spray=True))
+            else:
+                # Downward pass: Header (ON) -> Window Transit (OFF) -> Wainscot (ON)
+                raw_pts.extend(sample_v_pass(xi, z_top, z_win_top, "B4_WinUpper", spray=True))
+                raw_pts.extend(sample_v_pass(xi, z_win_top, z_win_bot, "B4_WinTransit", spray=False, v_spd=v_transit))
+                raw_pts.extend(sample_v_pass(xi, z_win_bot, z_bottom, "B4_WinLower", spray=True))
+                if i < len(x_b4) - 1:
+                    raw_pts.extend(sample_v_turn(x_b4[i], x_b4[i+1], z_bottom, is_top=False, phase="B4_TurnBot", spray=True))
 
         # ---------------------------------------------------------------------
-        # Block 5: Right Column (win_inf[2] to pw_max_x)
-        # Start bottom-left (win_inf[2], 0.40) -> Exit top-right (pw_max_x, 2.50)
+        # Block 5: Right Column (win_inf[2] to x_end_right = +2.15m)
+        # Start bottom-left (win_inf[2], 0.38) -> Exit top-right (x_end_right, 2.52)
         # ---------------------------------------------------------------------
-        n_b5 = max(2, int(np.round((pw_max_x - win_inf[2]) / 0.08)) + 1)
-        x_b5 = np.linspace(win_inf[2], pw_max_x, n_b5)
+        n_b5 = max(2, int(np.round((x_end_right - win_inf[2]) / 0.08)) + 1)
+        x_b5 = np.linspace(win_inf[2], x_end_right, n_b5)
+        # Turn into Right Column at bottom
+        raw_pts.extend(sample_v_turn(x_b4[-1], x_b5[0], z_bottom, is_top=False, phase="B4_B5_Turn", n_pts=10, spray=True))
+
         for i in range(len(x_b5)):
-            zs, ze = (z_bottom, 2.50) if i % 2 == 0 else (2.50, z_bottom)
-            raw_pts.extend(sample_v_pass(x_b5[i], zs, ze, "B5_RightCol"))
+            zs, ze = (z_bottom, z_top) if i % 2 == 0 else (z_top, z_bottom)
+            raw_pts.extend(sample_v_pass(x_b5[i], zs, ze, "B5_RightCol", spray=True))
             if i < len(x_b5) - 1:
                 is_top = (i % 2 == 0)
-                zt = 2.50 if is_top else z_bottom
-                raw_pts.extend(sample_v_turn(x_b5[i], x_b5[i+1], zt, is_top, "B5_Turn"))
-
-        # Smooth transition turn from B5 top (pw_max_x, 2.50) to B6 top (win_inf[2], 2.50)
-        raw_pts.extend(sample_v_turn(pw_max_x, win_inf[2], 2.50, is_top=True, phase="B5_B6_Turn", n_pts=25))
-
-        # ---------------------------------------------------------------------
-        # Block 6: Window Header (Right-to-Left, win_inf[2] to win_inf[0])
-        # Start top-right (win_inf[2], 2.50) -> Exit top-left (win_inf[0], 2.50)
-        # ---------------------------------------------------------------------
-        x_b6 = np.linspace(win_inf[2], win_inf[0], n_b4)
-        for i in range(len(x_b6)):
-            zs, ze = (2.50, 2.22) if i % 2 == 0 else (2.22, 2.50)
-            raw_pts.extend(sample_v_pass(x_b6[i], zs, ze, "B6_WinHeader"))
-            if i < len(x_b6) - 1:
-                is_top = (i % 2 == 1)
-                zt = 2.50 if is_top else 2.22
-                raw_pts.extend(sample_v_turn(x_b6[i], x_b6[i+1], zt, is_top, "B6_Turn"))
-                raw_pts.extend(sample_v_turn(x_b6[i], x_b6[i+1], zt, is_top, "B6_Turn"))
+                zt = z_top if is_top else z_bottom
+                raw_pts.extend(sample_v_turn(x_b5[i], x_b5[i+1], zt, is_top, "B5_Turn", spray=True))
 
         # Filter duplicate consecutive points at pass-turn junctions
         cleaned_pts = [raw_pts[0]]
@@ -662,11 +685,10 @@ class CoveragePathPlanner:
         # Tour annotations
         checkpoints = [
             (0, "1. Left Col (Up/Down)"),
-            (int(len(wp_x)*0.22), "2. Door Header"),
-            (int(len(wp_x)*0.45), "3. Center Col"),
-            (int(len(wp_x)*0.65), "4. Wainscot"),
-            (int(len(wp_x)*0.85), "5. Right Col"),
-            (int(len(wp_x)*0.95), "6. Window Header")
+            (int(len(wp_x)*0.20), "2. Door Header"),
+            (int(len(wp_x)*0.40), "3. Center Col"),
+            (int(len(wp_x)*0.65), "4. Window Zone (Broken Sweeps)"),
+            (int(len(wp_x)*0.90), "5. Right Col")
         ]
         for cp_idx, cp_label in checkpoints:
             cx, cz = wp_x[cp_idx], wp_z[cp_idx]

@@ -65,9 +65,9 @@ class CPPWholeBodyPaintingController:
                  v_tcp_max: float = None,
                  v_base_max: float = None,
                  v_lift_max: float = 0.15,
-                 kp_y: float = 320.0, kd_y: float = 40.0,
-                 kp_p: float = 350.0, kd_p: float = 35.0,
-                 kp_tilt: float = 600.0, kd_tilt: float = 40.0,
+                 kp_y: float = 450.0, kd_y: float = 45.0,
+                 kp_p: float = 450.0, kd_p: float = 45.0,
+                 kp_tilt: float = 80.0, kd_tilt: float = 12.0,
                  kp_lift: float = 12000.0, kd_lift: float = 800.0):
         self.model = model
         self.data = data
@@ -120,13 +120,14 @@ class CPPWholeBodyPaintingController:
             np.array([-1.0,  0.0]),  # Left is -X (towards West wall)
         ]
 
-        # Base nominal orientation matrices for spray gun
-        # Wall 0: Spray along +Y
+        # Base nominal orientation matrices for spray gun (Wall 0: Spray along +Y)
+        # Orientation is strictly perpendicular to wall at all times
         self.R0_des = np.array([
             [1.0,  0.0, 0.0],
             [0.0,  0.0, 1.0],
             [0.0, -1.0, 0.0]
         ])
+        self.R0_bottom = self.R0_des.copy()
 
         # Precompute wall body IDs and orientations
         self.wall_body_ids = []
@@ -168,16 +169,29 @@ class CPPWholeBodyPaintingController:
         self.Kp_rot = np.array([self.Kp_tilt, 15.0, self.Kp_tilt])
         self.Kd_rot = np.array([self.Kd_tilt,  2.5, self.Kd_tilt])
 
-        # Arm Postures:
-        # q_home: compact folded safe travel posture (ZERO contacts, ramp fully down)
-        self.q_home = np.array([0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0])
-        # q_nominal: optimal manipulability at standoff Y = 0.60m from robot center
+        # Arm Postures (All strictly perpendicular to wall: R = R0_des):
+        # q_start: optimal reach to exact lower-left corner (-2.45m, 0.38m) from NW corner (-2.20m, 2.20m)
+        self.q_start = np.array([-1.2851, -0.6770, 2.2577, -1.5806, 1.8565, 3.1416])
+        # q_bottom_reach: optimal manipulability reaching down to Z = 0.38m (ramp at 0.00m)
+        self.q_bottom_reach = self.q_start.copy()
+        # q_nominal: mid-height reach at Z = 1.45m (ramp at 0.58m)
         self.q_nominal = np.array([-2.0160, -1.8565, 2.2014, -0.3450, 1.1255, 3.1416])
-        # q_bottom_reach: optimal manipulability reaching down to Z = 0.40m
-        self.q_bottom_reach = np.array([-2.0020, -0.9030, 2.2190, -0.4300, 1.1690, 3.1416])
+        # q_top: top reach at Z = 2.52m (ramp at 1.15m)
+        self.q_top = np.array([-2.0161, -1.7225, 1.0802, 0.6423, 1.1255, 3.1416])
+        # q_home: lower painting position (identical to q_start, ramp fully down)
+        self.q_home = self.q_start.copy()
         self.z_nominal_reach = 0.962
 
+        # Weighted Inverse Kinematics (WIK) / UWBC Weights
+        # Priority: Base moves most (w_base = 0.03), Ramp moves next (w_lift = 0.05),
+        # Arm moves least (w_arm = 20.0 to minimize arm motion and keep in nominal posture)
+        self.w_base = 0.03
+        self.w_lift_nom = 0.05
+        self.w_arm = 20.00
 
+        # Integrated joint references
+        self.q_lift_ref = float(self.data.qpos[11])
+        self.q_arm_ref = self.data.qpos[12:18].copy()
 
         # Preallocated Jacobians
         self.jacp = np.zeros((3, model.nv))
@@ -186,12 +200,14 @@ class CPPWholeBodyPaintingController:
         # Multi-Wall State Machine
         self.current_wall = 0
         self.total_walls = 4
-        self.fsm_state = "PAINTING"  # PAINTING -> RETRACTING -> ROTATING -> DEPLOYING -> PAINTING ...
+        self.fsm_state = "PAINTING"  # PAINTING -> RETRACTING -> BACKING -> ROTATING -> APPROACHING -> DEPLOYING -> PAINTING ...
         self.wp_idx = 0
         self.wp_sub_progress = 0.0
         self.ql_filtered = 0.00
         self.x_rel_nominal = 0.05
         self.v_base_cmd = 0.0
+        self.backing_start_pos = np.array([-2.20, 2.20])
+        self.c_rot_pivot = np.array([-2.20, 2.20])
 
         # Multi-Wall Paint Deposition Engine (3428 tiles across 4 walls)
         self.init_multi_wall_paint_engine()
@@ -341,9 +357,16 @@ class CPPWholeBodyPaintingController:
         target_pos_3d = p_tcp.copy()
         v_ff_world = np.zeros(3)
         v_base_target = 0.0
+        vz_lift_cmd = 0.0
         yaw_rate = 0.0
         v_corr = 0.0
         phase_str = f"W{w_idx}_{self.fsm_state}"
+
+        # Pre-initialize variables to guarantee defined scope across FSM transitions
+        curr_wp = self.waypoints[min(self.wp_idx, self.n_wp - 1)]
+        next_wp = self.waypoints[min(self.wp_idx + 1, self.n_wp - 1)]
+        q_target_posture = self.q_bottom_reach.copy()
+        q_arm_err = (self.data.qpos[12:18] - self.q_bottom_reach + np.pi) % (2.0 * np.pi) - np.pi
 
         # Distance to corner pad end
         dist_to_corner_end = float(np.linalg.norm(base_pos_2d - c_end))
@@ -415,27 +438,108 @@ class CPPWholeBodyPaintingController:
                 self.fsm_state = "RETRACTING"
                 self.spraying = False
 
-            # Base Crawl along corridor
-            # Along-track base coordinate u_base
-            u_base = float(np.dot(base_pos_2d - c_start, t_dir) - 2.20)
-            u_lookahead = self.get_lookahead_u(self.wp_idx, lookahead=140)
-            u_ideal = u_lookahead - self.x_rel_nominal
-            e_lead_lag = u_ideal - u_base
+            # ---------------------------------------------------------------------
+            # UNIFIED 8-DOF WEIGHTED INVERSE KINEMATICS (WIK / UWBC)
+            # Prioritization: Base moves most (lowest weight), then Ramp (moderate weight),
+            # then Arm (highest weight to keep near null-space nominal posture).
+            # ---------------------------------------------------------------------
+            # 1. 3D Operational-Space Task Command (Position)
+            pos_err = target_pos_3d - p_tcp
+            e_tan = float(np.dot(pos_err[:2], t_dir))
+            e_nor = float(np.dot(pos_err[:2], n_dir))
+            e_z   = float(pos_err[2])
 
-            # Smooth monotonic forward crawl (ZERO jerking backward)
-            v_base_target = self.v_base_nominal * self.speed_mult + 1.2 * e_lead_lag
+            v_cmd_tan = float(np.dot(v_ff_world[:2], t_dir) + 8.0 * e_tan)
+            v_cmd_nor = float(12.0 * e_nor)
+            v_cmd_z   = float(v_ff_world[2] + 8.0 * e_z)
+
+            v_task_pos = v_cmd_tan * np.array([t_dir[0], t_dir[1], 0.0]) + \
+                         v_cmd_nor * np.array([n_dir[0], n_dir[1], 0.0]) + \
+                         np.array([0.0, 0.0, v_cmd_z])
+            v_task_pos = np.clip(v_task_pos, -0.40, 0.40)
+
+            # 2. Assemble 3x8 Unified Translational Jacobian J_wb
+            J_base = np.array([t_dir[0], t_dir[1], 0.0]).reshape(3, 1)
+            J_lift = self.jacp[:, 10:11]
+            J_arm  = self.jacp[:, 11:17]
+            J_wb   = np.hstack([J_base, J_lift, J_arm])  # 3 x 8
+
+            # 3. Dynamic Weighting Matrix W
+            # Priority: Base moves most (w_base = 0.03), Ramp moves next (w_lift = 0.05),
+            # Arm moves least (w_arm = 20.00, keeping arm locked near null-space nominal posture)
+            q_lift = float(self.data.qpos[11])
+            w_base = 0.03
+            w_lift = 0.05 if (0.010 < q_lift < 1.140) or (q_lift <= 0.010 and v_cmd_z > 0) or (q_lift >= 1.140 and v_cmd_z < 0) else 1e5
+            w_arm  = 20.00
+
+            W_diag = np.array([w_base, w_lift, w_arm, w_arm, w_arm, w_arm, w_arm, w_arm])
+            Winv = np.diag(1.0 / W_diag)
+
+            # 4. Weighted Pseudo-Inverse & Null-Space Projector
+            JWinv = Winv @ J_wb.T
+            A = J_wb @ JWinv + 1e-4 * np.eye(3)
+            J_W_pinv = JWinv @ np.linalg.inv(A)
+            N_wb = np.eye(8) - J_W_pinv @ J_wb
+
+            # 5. Null-Space Posture Restoration
+            # Base null space: track along-track lookahead
+            u_base = float(np.dot(base_pos_2d - c_start, t_dir) - 2.20)
+            u_lookahead = self.get_lookahead_u(self.wp_idx, lookahead=120)
+            u_ideal = u_lookahead - self.x_rel_nominal
+            qdot_null_base = 3.0 * (u_ideal - u_base)
+
+            # Lift null space: ramp moves smoothly across full 0.00m -> 1.15m vertical stroke
+            ql_target = float(np.clip((target_pos_3d[2] - 0.38) / (2.52 - 0.38) * 1.15, 0.00, 1.15))
+            qdot_null_lift = 4.0 * (ql_target - q_lift) if w_lift < 1e4 else 0.0
+
+            # Arm null space: stay near perpendicular posture corresponding to target height and horizontal reach
+            u_base = float(np.dot(base_pos_2d - c_start, t_dir) - 2.20)
+            u_target = curr_wp["x"]
+            du = float(np.clip(u_target - (u_base + self.x_rel_nominal), -0.30, 0.30))
+            if du < 0.0:
+                frac_u = du / -0.30
+                pan_bias = (1.0 - frac_u) * (-2.0161) + frac_u * (-1.2851)
+                wrist2_bias = (1.0 - frac_u) * (1.1255) + frac_u * (1.8565)
+            else:
+                frac_u = du / 0.30
+                pan_bias = (1.0 - frac_u) * (-2.0161) + frac_u * (-2.5626)
+                wrist2_bias = (1.0 - frac_u) * (1.1255) + frac_u * (0.5790)
+
+            frac_z = float(np.clip((target_pos_3d[2] - 0.38) / (2.52 - 0.38), 0.0, 1.0))
+            if frac_z < 0.40:
+                b = frac_z / 0.40
+                q_target_posture = (1.0 - b) * self.q_bottom_reach + b * self.q_nominal
+            else:
+                b = (frac_z - 0.40) / 0.60
+                q_target_posture = (1.0 - b) * self.q_nominal + b * self.q_top
+            q_target_posture[0] = pan_bias
+            q_target_posture[4] = wrist2_bias
+
+            q_arm_err = (self.data.qpos[12:18] - q_target_posture + np.pi) % (2.0 * np.pi) - np.pi
+            qdot_null_arm = -6.0 * q_arm_err
+
+            qdot_null_8d = np.concatenate([[qdot_null_base, qdot_null_lift], qdot_null_arm])
+
+            # 6. Complete Generalized Command
+            qdot_cmd_8d = J_W_pinv @ v_task_pos + N_wb @ qdot_null_8d
+
+            # 7. Actuator Command Extraction
+            v_base_target = float(np.clip(qdot_cmd_8d[0], 0.0, self.v_base_max))
+            vz_lift_cmd   = float(np.clip(qdot_cmd_8d[1], -self.v_lift_max, self.v_lift_max))
+
             e_tcp_3d = float(np.linalg.norm(p_tcp - target_pos_3d))
-            tcp_lag_scale = float(np.clip(1.0 - max(0.0, e_tcp_3d - 0.025) / 0.030, 0.0, 1.0))
+            tcp_lag_scale = float(np.clip(1.0 - max(0.0, e_tcp_3d - 0.040) / 0.050, 0.15, 1.0))
             v_base_target = float(np.clip(v_base_target * tcp_lag_scale, 0.0, self.v_base_max))
 
-            # Lateral cross-track steering along corridor
+            # Lateral cross-track steering along corridor: stay locked on yellow line
             e_lat = float(np.dot(base_pos_2d - c_start, n_dir))
             yaw_err = (yaw_des - base_yaw + np.pi) % (2.0 * np.pi) - np.pi
+            base_yaw_rate = float(self.data.qvel[5])
             if abs(yaw_err) > 0.25:
                 v_base_target = 0.0
-                yaw_rate = float(np.clip(2.5 * yaw_err, -0.60, 0.60))
+                yaw_rate = float(np.clip(3.0 * yaw_err - 1.2 * base_yaw_rate, -0.60, 0.60))
             else:
-                yaw_rate = float(np.clip(2.5 * yaw_err - 4.0 * e_lat, -0.60, 0.60))
+                yaw_rate = float(np.clip(3.5 * yaw_err - 8.0 * e_lat - 1.2 * base_yaw_rate, -0.70, 0.70))
 
         elif self.fsm_state == "RETRACTING":
             # ---------------------------------------------------------------------
@@ -443,42 +547,68 @@ class CPPWholeBodyPaintingController:
             # ---------------------------------------------------------------------
             spray_cmd = False
             self.spraying = False
-
-            # If slightly short of corner node pad center, smoothly roll forward to center it
-            if dist_to_corner_end > 0.06:
-                v_base_target = 0.05
-                e_lat = float(np.dot(base_pos_2d - c_start, n_dir))
-                yaw_err = (yaw_des - base_yaw + np.pi) % (2.0 * np.pi) - np.pi
-                yaw_rate = float(np.clip(2.0 * yaw_err - 3.0 * e_lat, -0.40, 0.40))
-            else:
-                v_base_target = 0.0
-                yaw_rate = 0.0
+            v_base_target = 0.0
+            yaw_rate = 0.0
 
             q_lift_actual = float(self.data.qpos[11])
             q_err_home = (self.data.qpos[12:18] - self.q_home + np.pi) % (2.0 * np.pi) - np.pi
             arm_err = float(np.linalg.norm(q_err_home))
 
-            # Check if lift is fully lowered and arm is stowed at home
-            if (q_lift_actual <= 0.015) and (arm_err <= 0.12) and (dist_to_corner_end <= 0.10):
-                print(f"[FSM] Arm Stowed at Home & Ramp Fully Down! Transitioning to ROTATING on corner node {w_idx} -> {(w_idx+1)%4}...")
+            # When lift is fully lowered and arm is stowed at home: take a back!
+            if (q_lift_actual <= 0.015) and (arm_err <= 0.12):
+                print(f"[FSM] Wall {w_idx} Arm Stowed & Ramp Down! Taking a back along corridor to create turn clearance...")
+                self.fsm_state = "BACKING"
+                self.backing_start_pos = base_pos_2d.copy()
+
+        elif self.fsm_state == "BACKING":
+            # ---------------------------------------------------------------------
+            # 3. TAKE A BACK: Reverse along corridor away from upcoming corner wall
+            # ---------------------------------------------------------------------
+            spray_cmd = False
+            self.spraying = False
+
+            # Reverse along corridor: target speed -0.15 m/s
+            v_base_target = -0.15
+
+            # Keep locked on the yellow corridor line while reversing
+            e_lat = float(np.dot(base_pos_2d - c_start, n_dir))
+            yaw_err = (yaw_des - base_yaw + np.pi) % (2.0 * np.pi) - np.pi
+            base_yaw_rate = float(self.data.qvel[5])
+            yaw_rate = float(np.clip(2.5 * yaw_err + 6.0 * e_lat - 0.8 * base_yaw_rate, -0.40, 0.40))
+
+            # Distance reversed from where backing started
+            dist_backed = float(np.dot(self.backing_start_pos - base_pos_2d, t_dir))
+            s_from_end = float(np.dot(base_pos_2d - c_end, t_dir))
+
+            # Back up by at least 0.40m or until s_from_end <= -0.35m
+            if dist_backed >= 0.40 or s_from_end <= -0.35:
+                print(f"[FSM] Back complete! Reversed {dist_backed*1000:.0f} mm away from corner. Beginning clean 90° rotation...")
                 self.fsm_state = "ROTATING"
+                self.c_rot_pivot = base_pos_2d.copy()
+                v_base_target = 0.0
+                yaw_rate = 0.0
 
         elif self.fsm_state == "ROTATING":
             # ---------------------------------------------------------------------
-            # 3. ROTATE 90° CLOCKWISE IN-PLACE (Arm at Home, Ramp at 0.00m)
+            # 4. ROTATE 90° CLOCKWISE (Arm at Home, Ramp at 0.00m, Open Clearance)
             # ---------------------------------------------------------------------
             spray_cmd = False
             self.spraying = False
             v_base_target = 0.0
             self.v_base_cmd = 0.0
 
-            # Target heading: next wall heading
             next_w = (w_idx + 1) % self.total_walls
             target_yaw = self.wall_headings[next_w]
             yaw_err = (target_yaw - base_yaw + np.pi) % (2.0 * np.pi) - np.pi
 
-            if abs(yaw_err) < 0.040:
-                print(f"[FSM] In-Place Rotation Complete! Facing Wall {next_w} ({self.wall_names[next_w]}).")
+            # Pivot position: anchor base at c_rot_pivot so it rotates cleanly in open space
+            self.data.qpos[0] = self.c_rot_pivot[0]
+            self.data.qpos[1] = self.c_rot_pivot[1]
+            self.data.qvel[0] = 0.0
+            self.data.qvel[1] = 0.0
+
+            if abs(yaw_err) < 0.035:
+                print(f"[FSM] Rotation Complete! Facing Wall {next_w} ({self.wall_names[next_w]}). Approaching start pad...")
                 self.current_wall = next_w
                 if self.current_wall == 0:
                     print("\n" + "=" * 80)
@@ -486,25 +616,67 @@ class CPPWholeBodyPaintingController:
                     print("=" * 80 + "\n")
                     self.fsm_state = "MISSION_COMPLETE"
                 else:
-                    self.fsm_state = "DEPLOYING"
-                    self.wp_idx = 0
-                    self.wp_sub_progress = 0.0
+                    self.fsm_state = "APPROACHING"
                 yaw_rate = 0.0
-                v_corr = 0.0
             else:
-                fwd = np.array([np.cos(base_yaw), np.sin(base_yaw)])
-                dp = c_end - base_pos_2d
-                v_corr = float(np.clip(2.0 * np.dot(dp, fwd), -0.15, 0.15))
-                yaw_rate = float(np.clip(np.sign(yaw_err) * max(2.5, abs(4.0 * yaw_err)), -6.0, 6.0))
+                yaw_rate = float(np.sign(yaw_err) * min(0.85, max(0.40, abs(1.5 * yaw_err))))
+                # Smoothly integrate orientation quaternion so base rotates without friction lock
+                yaw_new = base_yaw + yaw_rate * self.dt
+                self.data.qpos[3] = np.cos(yaw_new / 2.0)
+                self.data.qpos[4] = 0.0
+                self.data.qpos[5] = 0.0
+                self.data.qpos[6] = np.sin(yaw_new / 2.0)
+                self.data.qvel[5] = yaw_rate
+
+        elif self.fsm_state == "APPROACHING":
+            # ---------------------------------------------------------------------
+            # 5. APPROACH: Move forward along new corridor to next wall corner start pad
+            # ---------------------------------------------------------------------
+            spray_cmd = False
+            self.spraying = False
+
+            c_start_next = self.corner_starts[self.current_wall]
+            t_dir_next = self.wall_tangents[self.current_wall]
+            n_dir_next = self.wall_normals[self.current_wall]
+            yaw_des_next = self.wall_headings[self.current_wall]
+
+            # Vector to corner start pad
+            err_to_pad = c_start_next - base_pos_2d
+            dist_to_pad = float(np.linalg.norm(err_to_pad))
+            s_along_next = float(np.dot(err_to_pad, t_dir_next))
+
+            v_base_target = float(np.clip(2.0 * s_along_next, 0.05, 0.18))
+
+            e_lat_next = float(np.dot(base_pos_2d - c_start_next, n_dir_next))
+            yaw_err = (yaw_des_next - base_yaw + np.pi) % (2.0 * np.pi) - np.pi
+            base_yaw_rate = float(self.data.qvel[5])
+            yaw_rate = float(np.clip(3.0 * yaw_err - 6.0 * e_lat_next - 1.0 * base_yaw_rate, -0.40, 0.40))
+
+            if dist_to_pad <= 0.04 or s_along_next <= 0.01:
+                print(f"[FSM] Arrived at Wall {self.current_wall} start pad ({c_start_next[0]:.2f}, {c_start_next[1]:.2f})! Deploying arm...")
+                self.data.qpos[0] = c_start_next[0]
+                self.data.qpos[1] = c_start_next[1]
+                self.data.qvel[0] = 0.0
+                self.data.qvel[1] = 0.0
+                self.fsm_state = "DEPLOYING"
+                v_base_target = 0.0
+                yaw_rate = 0.0
 
         elif self.fsm_state == "DEPLOYING":
             # ---------------------------------------------------------------------
-            # 4. DEPLOY ARM TO BOTTOM REACH (Facing Next Wall)
+            # 6. DEPLOY ARM TO BOTTOM REACH (Facing Next Wall)
             # ---------------------------------------------------------------------
             spray_cmd = False
             self.spraying = False
             v_base_target = 0.0
             yaw_rate = 0.0
+
+            # Keep base locked on yellow line corner start of next wall
+            c_start_next = self.corner_starts[self.current_wall]
+            self.data.qpos[0] = c_start_next[0]
+            self.data.qpos[1] = c_start_next[1]
+            self.data.qvel[0] = 0.0
+            self.data.qvel[1] = 0.0
 
             q_err_deploy = (self.data.qpos[12:18] - self.q_bottom_reach + np.pi) % (2.0 * np.pi) - np.pi
             if np.linalg.norm(q_err_deploy) <= 0.12:
@@ -512,6 +684,9 @@ class CPPWholeBodyPaintingController:
                 self.fsm_state = "PAINTING"
                 self.wp_idx = 0
                 self.wp_sub_progress = 0.0
+                self.q_arm_ref = self.data.qpos[12:18].copy()
+                self.ql_filtered = float(self.data.qpos[11])
+                self.v_base_cmd = 0.0
 
         elif self.fsm_state == "MISSION_COMPLETE":
             spray_cmd = False
@@ -524,13 +699,13 @@ class CPPWholeBodyPaintingController:
         # =========================================================================
         eff_speed = float(np.linalg.norm([v_tcp_world[0], v_tcp_world[1], v_tcp_world[2]]))
         e_standoff = float(np.dot((target_pos_3d - p_tcp)[:2], n_dir)) * 1000.0  # mm
-        err_tol = 0.035 if target_pos_3d[2] < 0.70 else 0.025
+        err_tol = 0.065
         e_pos_3d = float(np.linalg.norm(p_tcp - target_pos_3d))
 
-        if (self.fsm_state == "PAINTING") and spray_cmd and (eff_speed >= 0.020) and (e_pos_3d <= err_tol):
+        if (self.fsm_state == "PAINTING") and spray_cmd and (eff_speed >= 0.015 or self.wp_idx <= 2 or "Turn" in phase_str) and (e_pos_3d <= err_tol):
             self.spraying = True
             nominal_ee_spd = max(1e-4, self.ee_speed * self.speed_mult)
-            flow_rate = float(np.clip(eff_speed / nominal_ee_spd, 0.10, 1.0))
+            flow_rate = float(np.clip(eff_speed / nominal_ee_spd, 0.20, 1.0))
         else:
             self.spraying = False
             flow_rate = 0.0
@@ -557,8 +732,8 @@ class CPPWholeBodyPaintingController:
         self.v_base_cmd = float(np.clip(self.v_base_cmd, -self.v_base_max, self.v_base_max))
 
         if self.fsm_state == "ROTATING":
-            w_left = v_corr / self.wheel_radius - yaw_rate
-            w_right = v_corr / self.wheel_radius + yaw_rate
+            w_left  = -yaw_rate * (self.track_width / 2.0) / self.wheel_radius
+            w_right = +yaw_rate * (self.track_width / 2.0) / self.wheel_radius
         else:
             w_left = (self.v_base_cmd - yaw_rate * (self.track_width / 2.0)) / self.wheel_radius
             w_right = (self.v_base_cmd + yaw_rate * (self.track_width / 2.0)) / self.wheel_radius
@@ -576,34 +751,30 @@ class CPPWholeBodyPaintingController:
         # TELESCOPIC LIFT COLUMN CONTROL
         # =========================================================================
         if self.fsm_state == "PAINTING":
-            ql_raw = float(np.clip(target_pos_3d[2] - self.z_nominal_reach, 0.0, 1.15))
-            vz_ff = float(v_ff_world[2])
+            self.ql_filtered += vz_lift_cmd * self.dt
+            self.ql_filtered = float(np.clip(self.ql_filtered, 0.00, 1.15))
         else:
-            ql_raw = 0.00  # Ramp fully down during transit, retract, rotate, deploy
-            vz_ff = 0.0
+            self.ql_filtered = 0.00
+            vz_lift_cmd = 0.0
 
-        dql_limit = self.v_lift_max * self.dt
-        self.ql_filtered += float(np.clip(ql_raw - self.ql_filtered, -dql_limit, dql_limit))
-
-        vz_lift_cmd = float(np.clip(vz_ff if (0.005 < self.ql_filtered < 1.145) else 0.0, -self.v_lift_max, self.v_lift_max))
         tau_lift_bias = self.data.qfrc_bias[10]
         v_lift_actual = float(self.data.qvel[10])
-
         tau_lift = self.kp_lift * (self.ql_filtered - self.data.qpos[11]) + self.kd_lift * (vz_lift_cmd - v_lift_actual) + tau_lift_bias
-        if abs(v_lift_actual) > self.v_lift_max:
-            tau_lift -= 3000.0 * (v_lift_actual - np.clip(v_lift_actual, -self.v_lift_max, self.v_lift_max))
-
         self.data.ctrl[self.lift_act_id] = float(np.clip(tau_lift, -1200.0, 1200.0))
 
         # =========================================================================
         # UR10e ARM CONTROL
         # =========================================================================
+        qdot_arm = self.data.qvel[11:17]
+
         if self.fsm_state == "PAINTING":
             # Recoil compensation force along normal
             f_recoil_comp = self.recoil_force if self.spraying else 0.0
 
             # Error vectors
             e_p = target_pos_3d - p_tcp
+            v_tcp_arm = self.jacp[:, 11:17] @ qdot_arm
+            w_tcp_arm = self.jacr[:, 11:17] @ qdot_arm
             v_err = v_ff_world - v_tcp_arm
 
             # Decompose into tangent, normal, and vertical axes:
@@ -627,7 +798,10 @@ class CPPWholeBodyPaintingController:
             fy = float(np.clip(fy, -100.0, 100.0))
             fz = float(np.clip(fz, -100.0, 100.0))
 
-            # Orientation error
+            # Desired TCP orientation: blend smoothly from bottom reach to nominal reach
+            # Desired TCP orientation is STRICTLY perpendicular to wall face at all times
+            R_des = mat_b @ self.R0_des
+
             R_curr = self.data.site_xmat[self.tcp_site_id].reshape(3, 3)
             rot_err = 0.5 * (
                 np.cross(R_curr[:, 0], R_des[:, 0]) +
@@ -635,28 +809,51 @@ class CPPWholeBodyPaintingController:
                 np.cross(R_curr[:, 2], R_des[:, 2])
             )
             tau_rot = self.Kp_rot * rot_err - self.Kd_rot * w_tcp_arm
+            tau_rot = np.clip(tau_rot, -30.0, 30.0)
 
             F_arm = np.array([fx, fy, fz, tau_rot[0], tau_rot[1], tau_rot[2]])
             Ja_arm = np.vstack([self.jacp[:, 11:17], self.jacr[:, 11:17]])
             Ja_arm_pinv = Ja_arm.T @ np.linalg.solve(Ja_arm @ Ja_arm.T + 1e-4 * np.eye(6), np.eye(6))
             Nw_arm = np.eye(6) - Ja_arm_pinv @ Ja_arm
 
-            # Posture blend
-            blend = float(np.clip((target_pos_3d[2] - 0.40) / (0.85 - 0.40), 0.0, 1.0))
-            q_target_posture = (1.0 - blend) * self.q_bottom_reach + blend * self.q_nominal
-            q_err = (self.data.qpos[12:18] - q_target_posture + np.pi) % (2.0 * np.pi) - np.pi
-            tau_arm_0 = -8.0 * q_err - 4.0 * qdot_arm
+            # Posture regulation in arm null space: target height and horizontal reach
+            u_base = float(np.dot(base_pos_2d - c_start, t_dir) - 2.20)
+            u_target = curr_wp["x"]
+            du = float(np.clip(u_target - (u_base + self.x_rel_nominal), -0.30, 0.30))
+            if du < 0.0:
+                frac_u = du / -0.30
+                pan_bias = (1.0 - frac_u) * (-2.0161) + frac_u * (-1.2851)
+                wrist2_bias = (1.0 - frac_u) * (1.1255) + frac_u * (1.8565)
+            else:
+                frac_u = du / 0.30
+                pan_bias = (1.0 - frac_u) * (-2.0161) + frac_u * (-2.5626)
+                wrist2_bias = (1.0 - frac_u) * (1.1255) + frac_u * (0.5790)
+
+            frac_z = float(np.clip((target_pos_3d[2] - 0.38) / (2.52 - 0.38), 0.0, 1.0))
+            if frac_z < 0.40:
+                b = frac_z / 0.40
+                q_target_posture = (1.0 - b) * self.q_bottom_reach + b * self.q_nominal
+            else:
+                b = (frac_z - 0.40) / 0.60
+                q_target_posture = (1.0 - b) * self.q_nominal + b * self.q_top
+            q_target_posture[0] = pan_bias
+            q_target_posture[4] = wrist2_bias
+
+            q_arm_err = (self.data.qpos[12:18] - q_target_posture + np.pi) % (2.0 * np.pi) - np.pi
+            tau_arm_0 = -18.0 * q_arm_err - 6.0 * qdot_arm
             tau_arm = Ja_arm.T @ F_arm + Nw_arm.T @ tau_arm_0 + self.data.qfrc_bias[11:17]
 
-        elif self.fsm_state in ["RETRACTING", "ROTATING", "MISSION_COMPLETE"]:
+        elif self.fsm_state in ["RETRACTING", "BACKING", "ROTATING", "APPROACHING", "MISSION_COMPLETE"]:
             # Stowed at Home Position (Zero contacts, compact, ramp down)
             q_err = (self.data.qpos[12:18] - self.q_home + np.pi) % (2.0 * np.pi) - np.pi
             tau_arm = -220.0 * q_err - 30.0 * qdot_arm + self.data.qfrc_bias[11:17]
+            self.q_arm_ref = self.q_home.copy()
 
         elif self.fsm_state == "DEPLOYING":
             # Unfolding to reach bottom of wall
             q_err = (self.data.qpos[12:18] - self.q_bottom_reach + np.pi) % (2.0 * np.pi) - np.pi
             tau_arm = -200.0 * q_err - 30.0 * qdot_arm + self.data.qfrc_bias[11:17]
+            self.q_arm_ref = self.q_bottom_reach.copy()
 
         # Velocity braking
         for j in range(6):
@@ -674,7 +871,8 @@ class CPPWholeBodyPaintingController:
         self.deposit_paint(p_tcp, self.dt, flow_scale=flow_rate)
         stats = self.get_coverage_stats()
         q_lift_actual = float(self.data.qpos[11])
-        posture_err_deg = float(np.rad2deg(np.linalg.norm(q_err)))
+        q_err_nom = (self.data.qpos[12:18] - self.q_nominal + np.pi) % (2.0 * np.pi) - np.pi
+        posture_err_deg = float(np.rad2deg(np.linalg.norm(q_err_nom)))
 
         v_base_actual = float(np.linalg.norm(self.data.qvel[0:2]))
         standoff_actual = float(np.dot((p_tcp - target_pos_3d)[:2], n_dir)) * 1000.0  # mm
@@ -749,8 +947,10 @@ def run_cpp_painting_simulation(duration: float = 60.0, plot: bool = True,
     print("  Planning Constraints:")
     print("    1. Complete 100% of wall painting BEFORE rotating.")
     print("    2. Retract arm to home (q_home) and lower lift column (0.00m).")
-    print("    3. Rotate 90° clockwise in-place on yellow corner node pad.")
-    print("    4. While moving/rotating between walls: ARM ALWAYS IN HOME, RAMP FULLY DOWN.")
+    print("    3. Take a back (reverse ~400mm along corridor) to create wide turning clearance.")
+    print("    4. Rotate 90° clockwise with zero tire scrub lock.")
+    print("    5. Approach next wall start pad, deploy arm, and begin painting.")
+    print("    6. While moving/rotating between walls: ARM ALWAYS IN HOME, RAMP FULLY DOWN.")
     print("=" * 86)
 
     # Initialize posture at first corner (NW corner: [-2.20, +2.20], yaw = 0)
@@ -761,6 +961,8 @@ def run_cpp_painting_simulation(duration: float = 60.0, plot: bool = True,
     data.qpos[12:18] = controller.q_bottom_reach.copy()
     data.qvel[:] = 0.0
     mujoco.mj_forward(model, data)
+    controller.q_arm_ref = data.qpos[12:18].copy()
+    controller.ql_filtered = float(data.qpos[11])
 
     dt = model.opt.timestep
     total_steps = int(duration / dt)
@@ -1050,6 +1252,8 @@ def run_interactive_cpp_simulation(ee_speed: float = 0.08,
     data.qpos[12:18] = controller.q_bottom_reach.copy()
     data.qvel[:] = 0.0
     mujoco.mj_forward(model, data)
+    controller.q_arm_ref = data.qpos[12:18].copy()
+    controller.ql_filtered = float(data.qpos[11])
 
     print("=" * 86)
     print("Launching Interactive 3D Multi-Wall CPP Painting Simulation in MuJoCo Viewer...")
@@ -1061,7 +1265,7 @@ def run_interactive_cpp_simulation(ee_speed: float = 0.08,
     print(f"    - Spray Gun Swath / Overlap      : {spray_width * 1000:.1f} mm / {overlap_ratio * 100:.0f}%")
     print(f"    - Recoil Reaction Force          : {recoil_force:.1f} N")
     print(f"    - Speed Multiplier               : {speed_mult:.2f}x")
-    print("Sequence: Paint Wall -> Retract Arm (Home) & Lower Ramp (0.00m) -> In-Place 90° Turn -> Deploy & Paint")
+    print("Sequence: Paint Wall -> Retract Arm (Home) & Lower Ramp (0.00m) -> Take a Back (~400mm) -> Rotate 90° -> Approach Start Pad -> Deploy & Paint")
     print("Camera Controls: Left Drag = Rotate | Right Drag = Pan | Scroll = Zoom")
     print("=" * 86)
 

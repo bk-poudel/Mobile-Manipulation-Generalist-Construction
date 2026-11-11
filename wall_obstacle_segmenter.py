@@ -20,7 +20,7 @@ class WallObstacleSegmenter:
     """
 
     def __init__(self,
-                 true_wall_bounds=(-2.20, 0.40, 2.20, 2.50),
+                 true_wall_bounds=(-2.45, 0.38, 2.45, 2.52),
                  door_bounds=(-1.60, 0.00, -0.70, 2.00),
                  window_bounds=(0.50, 1.10, 1.60, 2.00),
                  wall_y=3.0000):
